@@ -1,0 +1,11254 @@
+﻿"""Leon — Data Quality Platform."""
+
+import html
+import io
+import json
+import re
+import requests
+from datetime import datetime, timedelta, timezone
+
+# Fuseau horaire France (UTC+1 hiver, UTC+2 été)
+try:
+    from zoneinfo import ZoneInfo
+    TZ_FR = ZoneInfo("Europe/Paris")
+except ImportError:
+    TZ_FR = timezone(timedelta(hours=2))  # fallback été
+
+
+def _now() -> datetime:
+    return datetime.now(TZ_FR)
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import snowflake.connector as sf_connector
+import streamlit as st
+import streamlit.components.v1 as st_components
+
+# ---------------------------------------------------------------------------
+# Theme tokens
+# ---------------------------------------------------------------------------
+
+THEMES = {
+    "light": {
+        "sidebar_bg": "#1a2332",
+        "content_bg": "#f8fafc",
+        "card_bg": "#ffffff",
+        "card_bg_elevated": "#ffffff",
+        "border": "#e2e8f0",
+        "border_subtle": "#f1f5f9",
+        "text_primary": "#0f172a",
+        "text_secondary": "#64748b",
+        "accent": "#0d9488",
+        "accent_soft": "rgba(13,148,136,0.08)",
+        "accent_glow": "rgba(13,148,136,0.15)",
+        "high": "#ef4444",
+        "medium": "#f59e0b",
+        "low": "#3b82f6",
+        "success": "#10b981",
+        "sidebar_text": "#e2e8f0",
+        "nav_inactive": "#94a3b8",
+        "nav_hover": "rgba(255,255,255,0.06)",
+        "gradient_hero": "none",
+        "gradient_card": "none",
+    },
+    "dark": {
+        "sidebar_bg": "#0f172a",
+        "content_bg": "#0c1322",
+        "card_bg": "#1e293b",
+        "card_bg_elevated": "#1e293b",
+        "border": "#334155",
+        "border_subtle": "#1e293b",
+        "text_primary": "#f1f5f9",
+        "text_secondary": "#94a3b8",
+        "accent": "#2dd4bf",
+        "accent_soft": "rgba(45,212,191,0.12)",
+        "accent_glow": "rgba(45,212,191,0.20)",
+        "high": "#f87171",
+        "medium": "#fbbf24",
+        "low": "#60a5fa",
+        "success": "#34d399",
+        "sidebar_text": "#e2e8f0",
+        "nav_inactive": "#94a3b8",
+        "nav_hover": "rgba(255,255,255,0.06)",
+        "gradient_hero": "none",
+        "gradient_card": "none",
+    },
+}
+
+PAGES = [
+    ("dashboard", "Tableau de bord", ":material/dashboard:"),
+    ("customer_data", "Données clients", ":material/group:"),
+    ("run_analysis", "Lancer l'analyse", ":material/play_circle:"),
+    ("findings", "Anomalies", ":material/warning:"),
+    ("tasks", "Tâches", ":material/checklist:"),
+    ("exports", "Exports", ":material/download:"),
+    ("france", "France", ":material/public:"),
+    ("rule_catalog", "Catalogue de règles", ":material/menu_book:"),
+]
+
+TR_SEVERITY = {"All": "Tous", "HIGH": "Élevée", "MEDIUM": "Moyenne", "LOW": "Faible"}
+TR_STATUS = {
+    "All": "Tous", "Open": "Ouvert", "In Review": "En revue",
+    "Resolved": "Résolu", "Dismissed": "Rejeté",
+}
+TR_SUBJECT = {
+    "Compliance": "Conformité", "Duplicates": "Doublons",
+    "Address": "Adresse", "Web": "Web",
+}
+TR_ACCOUNT_STATUS = {"Active": "Actif", "Inactive": "Inactif"}
+
+SEVERITY_FILTER_OPTS = [("Tous", "All"), ("Élevée", "HIGH"), ("Moyenne", "MEDIUM"), ("Faible", "LOW")]
+STATUS_FILTER_OPTS = [
+    ("Tous", "All"), ("Ouvert", "Open"), ("En revue", "In Review"),
+    ("Résolu", "Resolved"), ("Rejeté", "Dismissed"),
+]
+
+
+RULE_TEMPLATES = [
+    {"id": "T-01", "name": "Contrôle conformité", "description": "Valide les identifiants légaux obligatoires (SIREN, TVA, forme juridique) selon la réglementation française.", "subject": "Compliance", "priority": "P1"},
+    {"id": "T-02", "name": "Validation SIRET", "description": "Vérifie la clé SIRET et recoupe avec le registre INSEE SIRENE.", "subject": "Compliance", "priority": "P1"},
+    {"id": "T-03", "name": "Détection de doublons", "description": "Identifie les doublons SIREN/SIRET dans la base clients.", "subject": "Duplicates", "priority": "P1"},
+    {"id": "T-04", "name": "Fraîcheur code NAF", "description": "Contrôle les codes NAF/APE par rapport à la dernière nomenclature INSEE.", "subject": "Compliance", "priority": "P2"},
+    {"id": "T-05", "name": "Validation adresse", "description": "Compare les adresses enregistrées avec le siège SIRENE.", "subject": "Address", "priority": "P2"},
+    {"id": "T-06", "name": "Présence web", "description": "Vérifie la disponibilité du site corporate et la cohérence du domaine e-mail.", "subject": "Web", "priority": "P3"},
+    {"id": "T-07", "name": "Format contact", "description": "Contrôle le format standard des téléphones et adresses e-mail.", "subject": "Compliance", "priority": "P3"},
+]
+
+ANALYSIS_SUBJECTS = [
+    {"id": "compliance", "name": "Conformité", "description": "Identifiants légaux, TVA, champs réglementaires", "rules": 4, "priority": "P1"},
+    {"id": "duplicates", "name": "Doublons", "description": "Détection de doublons SIREN/SIRET", "rules": 1, "priority": "P1"},
+    {"id": "address", "name": "Adresse", "description": "Validation d'adresse vs INSEE", "rules": 1, "priority": "P2"},
+    {"id": "web", "name": "Web", "description": "Vérification web : site, e-mail, croisement sources publiques", "rules": 2, "priority": "P3"},
+]
+
+# --- France : conformité SIREN / SIRET / TVA & e-facturation ----------------
+
+FR_AUDIT_TABLES = [
+    "QUALITY_TEST.COMMERCIAL_DATA.DIM_ACCOUNT",
+    "QUALITY_TEST.COMMERCIAL_DATA.DIM_ESTABLISHMENT",
+]
+
+FR_DB_SCHEMAS = [
+    "QUALITY_TEST.COMMERCIAL_DATA",
+    "QUALITY_TEST.COMMERCIAL_DATA",
+]
+
+# Mapping fixe quand la source = table Snowflake connue (pas de détection nécessaire)
+TABLE_COLUMN_MAPPING = {
+    "QUALITY_TEST.COMMERCIAL_DATA.DIM_ACCOUNT": {
+        "account_id": "account_id",
+        "company_name": "company_name",
+        "siren": "siren",
+        "siret": "siret",
+        "vat": "vat",
+        "address": "address",
+        "naf": "naf",
+        "country": "country",
+        "city": "city",
+        "legal_form": "legal_form",
+    },
+    "QUALITY_TEST.COMMERCIAL_DATA.DIM_ESTABLISHMENT": {
+        "account_id": "account_id",
+        "company_name": "company_name",
+        "siren": "siren",
+        "siret": "siret",
+        "vat": "vat",
+        "address": "address",
+        "naf": "naf",
+        "country": "country",
+        "city": "city",
+        "legal_form": "legal_form",
+    },
+}
+
+FR_SUBJECTS = [
+    {
+        "id": "compliance_einvoicing",
+        "name": "Conformité & E-Facturation",
+        "description": "Déclenche R01–R08 : SIREN, SIRET, cohérence SIREN+5, TVA intracom FR",
+        "rules": ["R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08"],
+    },
+]
+
+FR_BUSINESS_RULES = [
+    {"id": "R01", "name": "Format SIREN", "check": "9 chiffres numériques"},
+    {"id": "R02", "name": "Format SIRET", "check": "14 chiffres numériques"},
+    {"id": "R03", "name": "Cohérence SIRET", "check": "SIRET = SIREN + 5 caractères"},
+    {"id": "R04", "name": "TVA intracommunautaire", "check": "FR + 11 chiffres (clé Luhn)"},
+    {"id": "R05", "name": "Pays FR", "check": "Code pays = FR pour comptes domestiques"},
+    {"id": "R06", "name": "Code NAF/APE", "check": "Format XX.XXZ"},
+    {"id": "R07", "name": "Forme juridique", "check": "Champ renseigné (SA, SAS, SARL…)"},
+    {"id": "R08", "name": "Identifiant e-facturation", "check": "SIREN + SIRET valides pour PDP"},
+]
+
+STAGING_TABLE = "QUALITY_TEST.DATA_QUALITY.DQ_STAGING_IMPORT"
+
+DEDUP_KEY_OPTIONS = {
+    "siren": "SIREN",
+    "siret": "SIRET",
+    "account_id": "ID compte",
+    "company_name": "Raison sociale",
+    "vat": "N° TVA",
+}
+
+DEFAULT_DEDUP_KEYS = ["siren"]
+
+DEDUP_STRATEGIES = {
+    "keep_first": "Conserver la 1ère occurrence",
+    "keep_last": "Conserver la dernière occurrence",
+}
+
+RULE_TYPES = {
+    "regex": "Expression régulière",
+    "not_empty": "Champ obligatoire",
+    "in_list": "Valeur dans une liste",
+    "length": "Longueur (min:max)",
+}
+
+# Alias colonnes pour import CSV / Excel (formats variés)
+COLUMN_ALIASES = {
+    "siren": ["siren", "num_siren", "no_siren", "idsiren", "siren_number", "code_siren"],
+    "siret": ["siret", "num_siret", "no_siret", "idsiret", "siret_number", "code_siret", "commercial_registration", "commercial_registration_id", "registration_id"],
+    "company_name": [
+        "company_name", "raison_sociale", "raison sociale", "nom", "name", "company",
+        "entreprise", "libelle", "libellé", "account_name", "account name", "account", "client",
+        "afficher_nom", "afficher nom", "nom_societe", "nom société", "denomination",
+        "societe", "société", "nom_entreprise", "nom entreprise", "billing account name",
+        "subscription_name", "subscription name",
+    ],
+    "vat": ["vat", "tva", "vat_number", "num_tva", "tva_intra", "tva_intracom", "intracom_vat_id", "intracom vat id", "vat_id", "n_tva", "n_tva_intracom", "n° tva", "no tva", "n°_tva", "vat id", "tax_number", "tax number"],
+    "address": ["address", "adresse", "adresse_siege", "adresse_siège", "street", "adresse_complete", "adresse_complète", "adresse complète", "adresse complete"],
+    "city": ["city", "ville", "commune", "libelle_commune", "localite", "localité"],
+    "naf": ["naf", "ape", "code_naf", "code_ape", "naf_code"],
+    "country": ["country", "pays", "country_code", "code_pays", "bill_to_country", "bill to country"],
+    "account_id": ["account_id", "id", "id_compte", "customer_id", "code_client", "ref", "record_id"],
+    "legal_form": ["forme_juridique", "legal_form", "forme", "statut_juridique", "type_societe", "statut_legal"],
+}
+
+# Marketplace SIRENE database reference
+_SIRENE_DB = "FRENCH_NATIONAL_IDENTIFICATION_SYSTEM_OF_DIRECTORY_OF_BUSINESSES_AND_THEIR_ESTABLISHMENTS"
+_SIRENE_UL = f"{_SIRENE_DB}.SIRENE.V_UNITE_LEGALE"
+_SIRENE_ETAB = f"{_SIRENE_DB}.SIRENE.V_ETABLISSEMENT"
+
+IMPORT_FIELD_LABELS = {
+    "siren": "SIREN",
+    "siret": "SIRET",
+    "company_name": "Raison sociale",
+    "vat": "N° TVA intracom",
+    "address": "Adresse",
+    "city": "Ville",
+    "naf": "Code NAF/APE",
+    "country": "Pays",
+    "account_id": "ID compte",
+    "legal_form": "Forme juridique",
+}
+
+# ---------------------------------------------------------------------------
+# Snowflake data access layer  (login page → password auth)
+# ---------------------------------------------------------------------------
+
+
+@st.cache_resource
+def _build_conn(account: str, user: str, password: str, warehouse: str, passcode: str = "", authenticator: str = ""):
+    """Create and cache a Snowflake connection via username/password (+MFA) or SSO."""
+    params = dict(
+        account=account,
+        user=user,
+        warehouse=warehouse,
+        login_timeout=120,
+    )
+    if authenticator == "externalbrowser":
+        params["authenticator"] = "externalbrowser"
+    else:
+        params["password"] = password
+        if passcode:
+            params["passcode"] = passcode
+    return sf_connector.connect(**params)
+
+
+def _get_conn():
+    acc = st.session_state.get("sf_account", "")
+    usr = st.session_state.get("sf_user", "")
+    pwd = st.session_state.get("sf_password", "")
+    wh = st.session_state.get("sf_warehouse", "COMPUTE_WH")
+    mfa = st.session_state.get("sf_passcode", "")
+    auth = st.session_state.get("sf_authenticator", "")
+    if not acc or not usr:
+        return None
+    if not pwd and auth != "externalbrowser":
+        return None
+    try:
+        return _build_conn(acc, usr, pwd, wh, mfa, auth)
+    except Exception:
+        return None
+
+
+def _sf_query(sql: str) -> pd.DataFrame:
+    """Execute SQL, return DataFrame with lowercase column names."""
+    conn = _get_conn()
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        if cur.description:
+            cols = [d[0].lower() for d in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _sf_execute(sql: str, params: dict | None = None) -> bool:
+    """Execute a DML statement. Returns True on success, False on failure."""
+    conn = _get_conn()
+    if conn is None:
+        return False
+    try:
+        conn.cursor().execute(sql, params or {})
+        return True
+    except Exception:
+        return False
+
+
+def _dim_account_fqn() -> str:
+    db = st.session_state.get("sf_database", "")
+    schema = st.session_state.get("sf_schema", "")
+    table = st.session_state.get("sf_table", "DIM_ACCOUNT")
+    return f"{db}.{schema}.{table}"
+
+
+def _get_active_data() -> tuple:
+    """Return (DataFrame, source_label) from uploaded file or Snowflake table."""
+    if st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state:
+        df = st.session_state["uploaded_df"]
+        label = st.session_state.get("uploaded_filename", "Fichier")
+        return df, label
+    fqn = _dim_account_fqn()
+    raw = load_dim_account(fqn)
+    df = pd.DataFrame(raw) if raw else pd.DataFrame()
+    # Fallback: if Snowflake table is empty but we have an uploaded file, use it
+    if df.empty and "uploaded_df" in st.session_state:
+        df = st.session_state["uploaded_df"]
+        label = st.session_state.get("uploaded_filename", "Fichier")
+        return df, label
+    return df, fqn
+
+
+@st.cache_data(ttl=300)
+def load_dim_account(fqn: str = "QUALITY_TEST.COMMERCIAL_DATA.DIM_ACCOUNT") -> list[dict]:
+    df = _sf_query(f"SELECT * FROM {fqn}")
+    return df.to_dict("records") if not df.empty else []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_dq_findings(source_table: str = "") -> list[dict]:
+    where = ""
+    if source_table:
+        _escaped = source_table.replace("'", "''")
+        where = f" WHERE source_table = '{_escaped}'"
+    df = _sf_query(
+        "SELECT id, account_id, company_name, severity, status, subject, rule_id, "
+        "field, field_label, field_value, expected_value, finding_type, description, source_table "
+        f"FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS{where} ORDER BY created_at DESC"
+    )
+    return df.to_dict("records") if not df.empty else []
+
+
+@st.cache_data(ttl=30)
+def load_dq_audit_log() -> list[dict]:
+    df = _sf_query(
+        "SELECT * FROM QUALITY_TEST.DATA_QUALITY.DQ_AUDIT_LOG ORDER BY created_at DESC LIMIT 100"
+    )
+    if df.empty:
+        return []
+    if "created_at" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"created_at": "time"})
+    if "user_name" in df.columns and "user" not in df.columns:
+        df = df.rename(columns={"user_name": "user"})
+    return df.to_dict("records")
+
+
+@st.cache_data(ttl=300)
+def load_sirene_cache() -> dict:
+    """Load SIRENE references for accounts in DIM_ACCOUNT from the real Marketplace SIRENE."""
+    sirens_df = _sf_query("SELECT DISTINCT siren FROM QUALITY_TEST.COMMERCIAL_DATA.DIM_ACCOUNT WHERE siren IS NOT NULL AND siren <> ''")
+    if sirens_df.empty:
+        return {}
+    siren_list = ",".join(f"'{s}'" for s in sirens_df['siren'].tolist() if s)
+    df = _sf_query(f"""
+        SELECT u.SIREN AS siren,
+               u.DENOMINATION AS raison_sociale,
+               u.SIREN || u.NIC_SIEGE AS siret,
+               u.ACTIVITE_PRINCIPALE AS naf,
+               u.ETAT_ADMINISTRATIF AS statut,
+               u.CATEGORIE_JURIDIQUE AS categorie_juridique,
+               e.LIBELLE_COMMUNE || ' ' || COALESCE(e.CODE_POSTAL, '') AS adresse
+        FROM {_SIRENE_UL} u
+        LEFT JOIN {_SIRENE_ETAB} e ON e.SIRET = u.SIREN || u.NIC_SIEGE
+        WHERE u.SIREN IN ({siren_list})
+    """)
+    if df.empty:
+        return {}
+    return {str(row["siren"]): row for row in df.to_dict("records")}
+
+
+@st.cache_data(ttl=300)
+def lookup_sirene(siren: str) -> dict | None:
+    """Look up a single SIREN in the real Marketplace SIRENE (29M+ records)."""
+    if not siren or len(siren) != 9:
+        return None
+    df = _sf_query(f"""
+        SELECT u.SIREN AS siren,
+               u.DENOMINATION AS raison_sociale,
+               u.SIREN || u.NIC_SIEGE AS siret,
+               u.ACTIVITE_PRINCIPALE AS naf,
+               u.ETAT_ADMINISTRATIF AS statut,
+               u.CATEGORIE_JURIDIQUE AS categorie_juridique,
+               e.LIBELLE_COMMUNE AS ville,
+               e.CODE_POSTAL AS code_postal,
+               e.LIBELLE_COMMUNE || ' ' || COALESCE(e.CODE_POSTAL, '') AS adresse
+        FROM {_SIRENE_UL} u
+        LEFT JOIN {_SIRENE_ETAB} e ON e.SIRET = u.SIREN || u.NIC_SIEGE
+        WHERE u.SIREN = '{siren}'
+        LIMIT 1
+    """)
+    if df.empty:
+        return None
+    return df.to_dict("records")[0]
+
+
+@st.cache_data(ttl=300)
+def load_compliance_trend(days: int = 30) -> list[dict]:
+    df = _sf_query(f"""
+        SELECT DATE_TRUNC('DAY', created_at) AS date,
+               ROUND(100.0 * SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END)
+                     / COUNT(*), 1) AS score
+        FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS
+        WHERE created_at >= DATEADD('day', -{days}, CURRENT_DATE())
+        GROUP BY 1 ORDER BY 1
+    """)
+    return df.to_dict("records") if not df.empty else []
+
+
+@st.cache_data(ttl=60)
+def load_rule_hits() -> list[dict]:
+    df = _sf_query(
+        "SELECT rule_id AS rule, COUNT(*) AS hits "
+        "FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS GROUP BY rule_id ORDER BY hits DESC"
+    )
+    return df.to_dict("records") if not df.empty else []
+
+
+@st.cache_data(ttl=60)
+def load_dq_dimensions() -> list[dict]:
+    df = _sf_query(
+        "SELECT subject AS dimension, "
+        "ROUND(100.0 * SUM(CASE WHEN status='Resolved' THEN 1 ELSE 0 END) / COUNT(*), 0) AS score "
+        "FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS GROUP BY subject"
+    )
+    return df.to_dict("records") if not df.empty else []
+
+
+def write_dq_correction_db(c: dict) -> bool:
+    ok = _sf_execute(
+        "INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_CORRECTIONS "
+        "(id, anomaly_id, account_id, company_name, field, field_value, expected_value, "
+        "rule_id, action, rejection_reason, correction_status) "
+        "VALUES (%(id)s, %(anomaly_id)s, %(account_id)s, %(company_name)s, %(field)s, "
+        "%(field_value)s, %(expected_value)s, %(rule_id)s, %(action)s, "
+        "%(rejection_reason)s, %(status)s)",
+        c,
+    )
+    load_dq_findings.clear()
+    return ok
+
+
+def update_finding_status_db(finding_id: str, status: str) -> bool:
+    ok = _sf_execute(
+        "UPDATE QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS SET status = %(status)s WHERE id = %(id)s",
+        {"status": status, "id": finding_id},
+    )
+    load_dq_findings.clear()
+    return ok
+
+
+def update_findings_status_batch(finding_ids: list[str], status: str) -> int:
+    """Batch-update status for many findings using WHERE id IN (...) in chunks."""
+    if not finding_ids:
+        return 0
+    conn = _get_conn()
+    if conn is None:
+        return 0
+    updated = 0
+    CHUNK = 500
+    for i in range(0, len(finding_ids), CHUNK):
+        chunk = finding_ids[i : i + CHUNK]
+        placeholders = ", ".join([f"'{fid}'" for fid in chunk])
+        sql = f"UPDATE QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS SET status = '{status}' WHERE id IN ({placeholders})"
+        try:
+            conn.cursor().execute(sql)
+            updated += len(chunk)
+        except Exception:
+            pass
+    load_dq_findings.clear()
+    # Also update session state in-memory
+    id_set = set(finding_ids)
+    for f in st.session_state.get("findings", []):
+        if f["id"] in id_set:
+            f["status"] = status
+    for f in st.session_state.get("fr_upload_anomalies", []):
+        if f.get("id") in id_set:
+            f["status"] = status
+    return updated
+
+
+def write_audit_log_db(action: str, detail: str, user: str = "") -> None:
+    if not user:
+        user = st.session_state.get("sf_user", "unknown")
+    _sf_execute(
+        "INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_AUDIT_LOG (action, detail, user_name) "
+        "VALUES (%(action)s, %(detail)s, %(user)s)",
+        {"action": action, "detail": detail, "user": user},
+    )
+    load_dq_audit_log.clear()
+
+
+def call_sp_business_rules(table: str) -> str:
+    df = _sf_query(f"CALL QUALITY_TEST.DATA_QUALITY.SP_EXECUTE_BUSINESS_RULES('{table}')")
+    if not df.empty:
+        load_dq_findings.clear()
+        return str(df.iloc[0, 0])
+    return "Erreur: pas de résultat SP"
+
+
+# ---------------------------------------------------------------------------
+# Analysis History (persistent archive of every analysis run)
+# ---------------------------------------------------------------------------
+
+_HISTORY_TABLE = "QUALITY_TEST.DATA_QUALITY.DQ_ANALYSIS_HISTORY"
+
+
+def _ensure_history_table():
+    """Create DQ_ANALYSIS_HISTORY table if it doesn't exist."""
+    _sf_execute(f"""
+        CREATE TABLE IF NOT EXISTS {_HISTORY_TABLE} (
+            id VARCHAR DEFAULT UUID_STRING(),
+            source_table VARCHAR,
+            source_type VARCHAR,
+            filename VARCHAR,
+            total_rows INTEGER,
+            clean_rows INTEGER,
+            anomaly_count INTEGER,
+            duplicates_count INTEGER,
+            score INTEGER,
+            score_previous INTEGER,
+            rules_applied VARCHAR,
+            duration_s FLOAT,
+            user_name VARCHAR,
+            created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+    """)
+
+
+def write_analysis_history(stats: dict, source_label: str, source_type: str):
+    """Persist one analysis run to history. Computes score_previous automatically."""
+    _ensure_history_table()
+    # Find previous score for same source
+    prev_df = _sf_query(
+        f"SELECT score FROM {_HISTORY_TABLE} WHERE source_table = '{source_label.replace(chr(39), chr(39)+chr(39))}' "
+        f"ORDER BY created_at DESC LIMIT 1"
+    )
+    score_prev = int(prev_df.iloc[0, 0]) if not prev_df.empty else None
+
+    dedup = stats.get("dedup", {})
+    _sf_execute(
+        f"INSERT INTO {_HISTORY_TABLE} "
+        f"(source_table, source_type, filename, total_rows, clean_rows, anomaly_count, "
+        f"duplicates_count, score, score_previous, rules_applied, duration_s, user_name) "
+        f"VALUES (%(src)s, %(stype)s, %(fname)s, %(rows)s, %(clean)s, %(anom)s, "
+        f"%(dups)s, %(score)s, %(prev)s, %(rules)s, %(dur)s, %(user)s)",
+        {
+            "src": source_label,
+            "stype": source_type,
+            "fname": source_label if source_type == "file" else "",
+            "rows": stats.get("total_rows", 0),
+            "clean": stats.get("clean_rows", 0),
+            "anom": stats.get("anomaly_count", 0),
+            "dups": dedup.get("removed", 0),
+            "score": stats.get("score", 0),
+            "prev": score_prev,
+            "rules": ",".join(stats.get("active_rules", [])),
+            "dur": stats.get("duration_s", 0),
+            "user": st.session_state.get("sf_user", "unknown"),
+        },
+    )
+    load_analysis_history.clear()
+    load_analysis_dates.clear()
+
+
+@st.cache_data(ttl=30)
+def load_analysis_history() -> list[dict]:
+    """Load analysis history ordered by date desc."""
+    _ensure_history_table()
+    df = _sf_query(
+        f"SELECT * FROM {_HISTORY_TABLE} ORDER BY created_at DESC LIMIT 200"
+    )
+    if df.empty:
+        return []
+    df.columns = [c.lower() for c in df.columns]
+    return df.to_dict("records")
+
+
+@st.cache_data(ttl=60)
+def load_analysis_dates() -> list[str]:
+    """Return distinct dates (YYYY-MM-DD) that have at least one analysis."""
+    _ensure_history_table()
+    df = _sf_query(
+        f"SELECT DISTINCT TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS d FROM {_HISTORY_TABLE} ORDER BY d DESC"
+    )
+    if df.empty:
+        return []
+    return df.iloc[:, 0].tolist()
+
+
+def load_history_entry(history_id: str) -> dict | None:
+    """Load a single history entry by ID."""
+    df = _sf_query(
+        f"SELECT * FROM {_HISTORY_TABLE} WHERE id = '{history_id.replace(chr(39), chr(39)+chr(39))}' LIMIT 1"
+    )
+    if df.empty:
+        return None
+    df.columns = [c.lower() for c in df.columns]
+    return df.to_dict("records")[0]
+
+
+# ---------------------------------------------------------------------------
+# Custom Rules CRUD (persisted to Snowflake)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60)
+def list_custom_rules(active_only: bool = True) -> list[dict]:
+    where = "WHERE is_active = TRUE" if active_only else ""
+    df = _sf_query(f"SELECT * FROM QUALITY_TEST.DATA_QUALITY.DQ_CUSTOM_RULES {where} ORDER BY created_at DESC")
+    if df.empty:
+        return []
+    df.columns = [c.lower() for c in df.columns]
+    return df.to_dict("records")
+
+
+def create_custom_rule(name: str, target_field: str, rule_type: str, pattern: str, severity: str, description: str = "") -> str | None:
+    existing = list_custom_rules(active_only=False)
+    # Skip if a rule with the same name already exists
+    for r in existing:
+        if r.get("name", "").strip().lower() == name.strip().lower():
+            return None  # Already exists
+    cid = f"C{len(existing) + 1:03d}"
+    _sf_execute(
+        "INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_CUSTOM_RULES "
+        "(id, name, description, target_field, rule_type, pattern, severity) "
+        "VALUES (%(id)s, %(name)s, %(desc)s, %(field)s, %(type)s, %(pattern)s, %(sev)s)",
+        {"id": cid, "name": name, "desc": description, "field": target_field,
+         "type": rule_type, "pattern": pattern, "sev": severity},
+    )
+    list_custom_rules.clear()
+    add_audit_entry("Règle créée", f"{cid}: {name} ({target_field}, {rule_type})")
+    return cid
+
+
+def toggle_custom_rule(rule_id: str, active: bool):
+    _sf_execute(
+        "UPDATE QUALITY_TEST.DATA_QUALITY.DQ_CUSTOM_RULES SET is_active = %(active)s WHERE id = %(id)s",
+        {"active": active, "id": rule_id},
+    )
+    list_custom_rules.clear()
+
+
+def delete_custom_rule(rule_id: str):
+    _sf_execute(
+        "DELETE FROM QUALITY_TEST.DATA_QUALITY.DQ_CUSTOM_RULES WHERE id = %(id)s",
+        {"id": rule_id},
+    )
+    list_custom_rules.clear()
+    add_audit_entry("Règle supprimée", rule_id)
+
+
+# ---------------------------------------------------------------------------
+# Table columns + Cortex AI helpers (JOIN key + rule suggestions)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=120)
+def load_table_columns(table_fqn: str) -> list[str]:
+    """Return column names for any Snowflake table."""
+    df = _sf_query(f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_CATALOG || '.' || TABLE_SCHEMA || '.' || TABLE_NAME = '{table_fqn.upper()}' ORDER BY ORDINAL_POSITION")
+    if df.empty:
+        parts = table_fqn.split(".")
+        if len(parts) == 3:
+            df = _sf_query(f"SHOW COLUMNS IN TABLE {table_fqn}")
+            if not df.empty:
+                col_name = "column_name" if "column_name" in df.columns else df.columns[2]
+                return df[col_name].tolist()
+        return []
+    return df.iloc[:, 0].tolist()
+
+
+def suggest_join_key_cortex(primary_cols: list[str], secondary_cols: list[str],
+                            primary_table: str, secondary_table: str) -> dict:
+    """Use Cortex AI to suggest the best JOIN key between two tables."""
+    prompt = (
+        f"Given two Snowflake tables:\n"
+        f"Table A ({primary_table}): columns = {primary_cols}\n"
+        f"Table B ({secondary_table}): columns = {secondary_cols}\n\n"
+        f"Which columns should be used as the JOIN key? Pick the most likely pair based on naming conventions and semantics.\n"
+        f'Return ONLY a JSON object: {{"primary_key": "COLUMN_FROM_A", "secondary_key": "COLUMN_FROM_B", "confidence": "high|medium|low"}}'
+    )
+    try:
+        result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${prompt}$$) AS r")
+        raw = result.iloc[0]["r"] if not result.empty else "{}"
+        # Extract JSON from response
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        return json.loads(raw[start:end])
+    except Exception:
+        return {"primary_key": primary_cols[0] if primary_cols else "", "secondary_key": secondary_cols[0] if secondary_cols else "", "confidence": "low"}
+
+
+def suggest_rules_cortex(table_fqn: str, columns: list[str], sample_rows: list[dict]) -> list[dict]:
+    """Use Cortex AI to suggest data quality rules for a table."""
+    prompt = (
+        f"Analyse cette table Snowflake pour détecter des problèmes de qualité de données.\n"
+        f"Table: {table_fqn}\n"
+        f"Colonnes: {columns}\n"
+        f"Échantillon (3 lignes): {json.dumps(sample_rows[:3], default=str)}\n\n"
+        f"Suggère 3 à 5 règles de qualité de données. Pour chaque règle retourne un objet JSON:\n"
+        f'- "name": nom descriptif en français\n'
+        f'- "target_field": nom exact de la colonne (de la liste ci-dessus)\n'
+        f'- "rule_type": un parmi "regex", "not_empty", "in_list", "length"\n'
+        f'- "pattern": le pattern de validation (regex, ou "min:max" pour length, ou liste séparée par des virgules pour in_list)\n'
+        f'- "severity": "HIGH", "MEDIUM", ou "LOW"\n'
+        f'- "description": description en une ligne en français\n\n'
+        f"Retourne UNIQUEMENT un tableau JSON (pas de texte autour)."
+    )
+    try:
+        result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${prompt}$$) AS r")
+        raw = result.iloc[0]["r"] if not result.empty else "[]"
+        start = raw.index("[")
+        end = raw.rindex("]") + 1
+        rules = json.loads(raw[start:end])
+        # Validate each rule has required keys
+        valid = []
+        for r in rules:
+            if all(k in r for k in ("name", "target_field", "rule_type")):
+                r.setdefault("pattern", "")
+                r.setdefault("severity", "MEDIUM")
+                r.setdefault("description", "")
+                valid.append(r)
+        return valid
+    except Exception:
+        return []
+
+def persist_scoring(run_id: str, scores: list[dict]):
+    if not scores:
+        return
+    _batch_size = 50
+    for _bi in range(0, len(scores), _batch_size):
+        _batch = scores[_bi:_bi + _batch_size]
+        _values_parts = []
+        _params = {}
+        for _j, s in enumerate(_batch):
+            _pk = f"s{_bi}_{_j}"
+            _values_parts.append(
+                f"(%(run_{_pk})s, %(aid_{_pk})s, %(rn_{_pk})s, %(sc_{_pk})s, %(p_{_pk})s, %(t_{_pk})s, %(f_{_pk})s)"
+            )
+            _params.update({
+                f"run_{_pk}": run_id, f"aid_{_pk}": s.get("account_id", ""),
+                f"rn_{_pk}": s.get("row_num", 0), f"sc_{_pk}": s.get("score", 0),
+                f"p_{_pk}": s.get("rules_passed", 0), f"t_{_pk}": s.get("rules_total", 0),
+                f"f_{_pk}": json.dumps(s.get("flags", [])),
+            })
+        _sf_execute(
+            f"INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_SCORING "
+            f"(run_id, account_id, row_num, score, rules_passed, rules_total, flags) "
+            f"VALUES {','.join(_values_parts)}",
+            _params,
+        )
+
+
+def persist_dedup_result(run_id: str, source_table: str, original: int, clean: int, removed: int, keys: list, strategy: str, fuzzy_threshold: float = 0.0):
+    _sf_execute(
+        "INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_DEDUP_RESULTS "
+        "(run_id, source_table, original_count, clean_count, removed_count, dedup_keys, strategy, fuzzy_threshold) "
+        "VALUES (%(run_id)s, %(src)s, %(orig)s, %(clean)s, %(rem)s, %(keys)s, %(strat)s, %(fuzzy)s)",
+        {"run_id": run_id, "src": source_table, "orig": original, "clean": clean,
+         "rem": removed, "keys": ",".join(keys), "strat": strategy, "fuzzy": fuzzy_threshold},
+    )
+
+
+@st.cache_data(ttl=60)
+def load_scoring(run_id: str = "") -> list[dict]:
+    where = f"WHERE run_id = '{run_id}'" if run_id else ""
+    df = _sf_query(f"SELECT * FROM QUALITY_TEST.DATA_QUALITY.DQ_SCORING {where} ORDER BY row_num")
+    if df.empty:
+        return []
+    df.columns = [c.lower() for c in df.columns]
+    return df.to_dict("records")
+
+
+@st.cache_data(ttl=600)
+def list_snowflake_databases() -> list[str]:
+    df = _sf_query("SHOW DATABASES")
+    if df.empty:
+        return []
+    col = "name" if "name" in df.columns else df.columns[0]
+    return sorted(df[col].tolist())
+
+
+@st.cache_data(ttl=300)
+def list_snowflake_schemas(database: str) -> list[str]:
+    df = _sf_query(f"SHOW SCHEMAS IN DATABASE {database}")
+    if df.empty:
+        return []
+    col = "name" if "name" in df.columns else df.columns[0]
+    return [s for s in sorted(df[col].tolist()) if s not in ("INFORMATION_SCHEMA", "PUBLIC")]
+
+
+@st.cache_data(ttl=300)
+def list_snowflake_tables(database: str, schema: str) -> list[str]:
+    df = _sf_query(f"SHOW TABLES IN SCHEMA {database}.{schema}")
+    if df.empty:
+        return []
+    col = "name" if "name" in df.columns else df.columns[0]
+    return sorted(df[col].tolist())
+
+
+def load_table_as_dataframe(table: str) -> pd.DataFrame:
+    df = _sf_query(f"SELECT * FROM {table} LIMIT 5000")
+    if df.empty:
+        return pd.DataFrame(columns=["ACCOUNT_ID", "COMPANY_NAME", "SIREN", "SIRET", "ADDRESS", "NAF"])
+    # Snowflake returns uppercase columns — keep them as-is
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+
+def _mapping_for_table(table_fqn: str, df_columns: list[str] | None = None) -> dict[str, str | None]:
+    """Return column mapping for a known Snowflake table or auto-detect from headers."""
+    if table_fqn in TABLE_COLUMN_MAPPING:
+        fixed = TABLE_COLUMN_MAPPING[table_fqn]
+        mapping = {field: col for field, col in fixed.items() if col}
+        # Normalize to lowercase (Snowflake returns lowercase from _sf_query)
+        if df_columns:
+            df_cols_lower = [c.lower() for c in df_columns]
+            for field, col in list(mapping.items()):
+                if col and col not in df_columns and col.lower() in df_cols_lower:
+                    mapping[field] = col.lower()
+            auto = detect_column_mapping(list(df_columns))
+            for field, col in auto.items():
+                if field not in mapping and col:
+                    mapping[field] = col
+        return mapping
+    if df_columns:
+        return detect_column_mapping(list(df_columns))
+    return {field: None for field in IMPORT_FIELD_LABELS}
+
+
+def _auto_correct_finding(f: dict) -> str:
+    """Correction via INSEE (registre SIRENE réel) — PAS d'invention par IA.
+    Utilise d'abord la valeur expected_value déjà trouvée pendant l'analyse,
+    sinon recherche dans le registre."""
+    company = f.get("company_name", "")
+    field = f.get("field", "").upper()
+    field_value = f.get("field_value", "")
+    expected = f.get("expected_value", "")
+
+    # --- Quick path: expected_value contains a concrete value from analysis ---
+    # During analysis, INSEE lookup already found the correct value and stored it
+    _generic_expected = {
+        "9 chiffres", "9 chiffres numériques", "14 chiffres", "14 chiffres numériques",
+        "FR + 11 caractères", "TVA FR obligatoire", "Non vide", "XX.XXZ",
+        "XX.XXZ (ex : 6202A)", "SA, SAS, SARL, SE…", "Active (A)",
+        "Présent au registre SIRENE", "Format XXXXZ (4 chiffres + 1 lettre)",
+        "Format FRxxxxxxxxxxx", "FRxxxxxxxxxxx", "TVA intracommunautaire FR",
+    }
+    # Also reject regex patterns (contain ^ $ [ ] { } etc.) as non-concrete
+    _is_generic = (
+        not expected
+        or expected in _generic_expected
+        or expected.startswith("Valeur parmi")
+        or expected.startswith("FR + clé")
+        or expected.startswith("FR + 2 chiffres")
+        or expected.startswith("Format ")
+        or expected.startswith("Unique (")
+        or expected.startswith("Longueur entre")
+        or expected.startswith("Longueur ")
+        or re.search(r'[\^\$\[\]\{\}\+\*\?\\]', expected)  # regex pattern detected
+    )
+    if expected and not _is_generic:
+        # Concrete expected value (like FR38907794135) → use directly as correction
+        return f"{expected} (confiance: 95% — INSEE)"
+
+    # --- No concrete expected value → no correction proposed ---
+    # Don't guess from SIREN extraction in description — it's unreliable
+    # The user should re-run the analysis to get proper INSEE-backed corrections
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Web Verification Agent — AI-assisted web cross-check
+# ---------------------------------------------------------------------------
+
+def _web_verify_finding(finding: dict) -> dict:
+    """Verify a finding by searching the web and using LLM to judge coherence."""
+    company = finding.get("company_name", "")
+    field_label = finding.get("field_label", "")
+    field_value = str(finding.get("field_value", "") or "—")
+    expected = str(finding.get("expected_value", "") or "")
+    rule_id = finding.get("rule_id", "")
+    account_id = finding.get("account_id", "")
+
+    sources = []
+    web_snippets = []
+
+    # --- 0. Basic format validation BEFORE any web check ---
+    _format_issue = ""
+    if "siren" in field_label.lower() or rule_id == "R01":
+        _clean = field_value.replace(" ", "")
+        if not _clean.isdigit() or len(_clean) != 9:
+            _format_issue = f"SIREN invalide : doit contenir exactement 9 chiffres (trouvé {len(_clean)} caractères)"
+    elif "siret" in field_label.lower() or rule_id == "R02":
+        _clean = field_value.replace(" ", "")
+        if not _clean.isdigit() or len(_clean) != 14:
+            _format_issue = f"SIRET invalide : doit contenir exactement 14 chiffres (trouvé {len(_clean)} caractères)"
+    elif "tva" in field_label.lower() or rule_id == "R04":
+        _clean = field_value.replace(" ", "")
+        if not (_clean.startswith("FR") and len(_clean) == 13 and _clean[2:].isdigit()):
+            _format_issue = f"TVA invalide : format attendu FRxx + 9 chiffres (trouvé: {field_value})"
+
+    if _format_issue:
+        return {
+            "sources": ["validation format"],
+            "web_summary": _format_issue,
+            "llm_judgment": f"Incohérent — {_format_issue}",
+            "confidence": 95,
+            "action": "Corriger la valeur",
+        }
+
+    # --- 1. Contextual web search based on field type ---
+    _company_info = {}
+    _source_urls = []
+    try:
+        # Pappers (free SIREN lookup — returns 404 if SIREN does NOT exist)
+        siren_val = ""
+        if "siren" in field_label.lower() or rule_id in ("R01", "R03", "INSEE"):
+            siren_val = expected if expected and expected.isdigit() and len(expected) == 9 else field_value
+            if siren_val and siren_val.replace(" ", "").isdigit() and len(siren_val.replace(" ", "")) == 9:
+                try:
+                    r = requests.get(f"https://api.pappers.fr/v2/entreprise?siren={siren_val.strip()}", timeout=8)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("siren") and not data.get("error"):
+                            _company_info = {
+                                "denomination": data.get("denomination", ""),
+                                "siren": data.get("siren", ""),
+                                "siret_siege": data.get("siege", {}).get("siret", ""),
+                                "forme_juridique": data.get("forme_juridique", ""),
+                                "adresse": f"{data.get('siege', {}).get('adresse_ligne_1', '')} {data.get('siege', {}).get('code_postal', '')} {data.get('siege', {}).get('ville', '')}".strip(),
+                                "naf": data.get("code_naf", ""),
+                                "statut": "Active" if data.get("entreprise_cessee") == False else "Cessée",
+                                "date_creation": data.get("date_creation", ""),
+                                "capital": data.get("capital_formate", ""),
+                            }
+                            web_snippets.append(
+                                f"Pappers.fr: {_company_info['denomination']} — "
+                                f"SIREN {_company_info['siren']}, "
+                                f"forme juridique: {_company_info['forme_juridique']}, "
+                                f"siège: {_company_info['adresse']}, "
+                                f"NAF: {_company_info['naf']}, "
+                                f"statut: {_company_info['statut']}"
+                            )
+                            sources.append("pappers.fr")
+                            _source_urls.append(f"https://www.pappers.fr/entreprise/{siren_val.strip()}")
+                        else:
+                            web_snippets.append(f"Pappers.fr: SIREN {siren_val} INTROUVABLE — n'existe pas au registre")
+                            sources.append("pappers.fr")
+                            _source_urls.append(f"https://www.pappers.fr/entreprise/{siren_val.strip()}")
+                    elif r.status_code in (404, 400):
+                        web_snippets.append(f"Pappers.fr: SIREN {siren_val} INTROUVABLE (HTTP {r.status_code})")
+                        sources.append("pappers.fr")
+                        _source_urls.append(f"https://www.pappers.fr/entreprise/{siren_val.strip()}")
+                except Exception:
+                    pass
+
+        # Societe.com check — verify actual SIREN page exists (not just search results)
+        if siren_val and siren_val.strip().isdigit() and len(siren_val.strip()) == 9:
+            _societe_url = f"https://www.societe.com/societe/-{siren_val.strip()}.html"
+            try:
+                r = requests.get(_societe_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=False)
+                if r.status_code == 200:
+                    sources.append("societe.com")
+                    web_snippets.append(f"Societe.com: page entreprise EXISTANTE pour SIREN {siren_val}")
+                    _source_urls.append(_societe_url)
+                elif r.status_code in (301, 302):
+                    _redirect_url = r.headers.get("Location", _societe_url)
+                    sources.append("societe.com")
+                    web_snippets.append(f"Societe.com: entreprise trouvée pour SIREN {siren_val}")
+                    _source_urls.append(_redirect_url if _redirect_url.startswith("http") else _societe_url)
+                else:
+                    if "societe.com" not in [s for s in sources]:
+                        web_snippets.append(f"Societe.com: SIREN {siren_val} NON TROUVÉ (HTTP {r.status_code})")
+                        sources.append("societe.com")
+            except Exception:
+                pass
+
+        # Company website check (Google) — only if no Pappers result
+        if company and not web_snippets:
+            _search_name = company.replace(" ", "+").replace("&", "%26")
+            try:
+                r = requests.get(
+                    f"https://www.google.com/search?q={_search_name}+entreprise+france+siren",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    import re as _re
+                    _snippets = _re.findall(r'<span[^>]*>(.*?)</span>', r.text)
+                    _useful = [s for s in _snippets if len(s) > 40 and company.split()[0].lower() in s.lower()][:3]
+                    if _useful:
+                        web_snippets.append("Google: " + " | ".join(_useful[:2]))
+                        sources.append("google.com")
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    # --- 2. Fallback: use Cortex LLM knowledge if no web results ---
+    if not web_snippets:
+        web_snippets.append("(Aucune source web accessible — utilisation des connaissances du modèle)")
+        sources.append("connaissances LLM")
+
+    web_summary = "\n".join(web_snippets)
+
+    # --- 3. LLM Judgment ---
+    prompt = f"""Tu es un agent de vérification de données B2B françaises.
+Entreprise: {company}
+Champ vérifié: {field_label}
+Valeur en base: {field_value}
+Valeur attendue/référence: {expected}
+Règle déclenchée: {rule_id}
+
+Informations web trouvées:
+{web_summary}
+
+Analyse cette anomalie et réponds UNIQUEMENT en JSON valide (pas de markdown):
+{{"verdict": "coherent" ou "incoherent" ou "incertain", "confidence": nombre entre 0 et 100, "explanation": "explication en français (2-3 phrases max)", "suggested_value": "valeur corrigée ou null si pas de correction", "suggested_action": "action recommandée en français (1 phrase)"}}"""
+
+    try:
+        _safe_prompt = prompt.replace("$$", "\\$\\$")
+        result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${_safe_prompt}$$) AS r")
+        if not result.empty:
+            import json as _json
+            raw = str(result.iloc[0]["r"]).strip()
+            # Clean markdown code block if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            verdict_data = _json.loads(raw)
+        else:
+            verdict_data = {"verdict": "incertain", "confidence": 30, "explanation": "Impossible d'obtenir un jugement.", "suggested_value": None, "suggested_action": "Vérification manuelle recommandée"}
+    except Exception as e:
+        verdict_data = {"verdict": "incertain", "confidence": 20, "explanation": f"Erreur lors du jugement: {str(e)[:100]}", "suggested_value": None, "suggested_action": "Vérification manuelle recommandée"}
+
+    return {
+        "company": company,
+        "field_label": field_label,
+        "field_value": field_value,
+        "expected_value": expected,
+        "sources": sources,
+        "source_urls": _source_urls,
+        "company_info": _company_info,
+        "web_summary": web_summary,
+        **verdict_data,
+    }
+
+# ---------------------------------------------------------------------------
+# 3-Phase Deduplication Pipeline
+# ---------------------------------------------------------------------------
+
+def _finalize_dedup_pipeline(df, mapping, table_fqn, t):
+    """Apply user-approved dedup phases and transition to 'done' state."""
+    working_df = df.copy()
+    removed_total = 0
+    corrections = st.session_state.get("dedup_corrections", [])
+    # Phase 1: apply exact dedup if user approved
+    if st.session_state.get("dedup_phase1_applied"):
+        accepted_exact = st.session_state.get("dedup_exact_groups", [])
+        if accepted_exact:
+            working_df, n = _dedup_apply_decisions(working_df, accepted_exact, "keep_first")
+            removed_total += n
+    # Phase 2: apply corrections if user approved
+    if st.session_state.get("dedup_phase2_applied"):
+        cleaned = st.session_state.get("dedup_cleaned_df")
+        if cleaned is not None:
+            working_df = cleaned
+    # Phase 3: apply similarity merges if user approved
+    if st.session_state.get("dedup_phase3_applied"):
+        accepted_sim = st.session_state.get("dedup_accepted_sim", [])
+        if accepted_sim:
+            working_df, n = _dedup_apply_decisions(working_df, accepted_sim, "keep_first")
+            removed_total += n
+    st.session_state["wiz_clean_df"] = working_df
+    st.session_state["wiz_removed_count"] = removed_total
+    persist_dedup_result(
+        f"WIZ-{_now().strftime('%Y%m%d%H%M%S')}", table_fqn,
+        len(df), len(working_df), removed_total,
+        st.session_state.get("dedup_compare_cols_saved", ["siren"]), "pipeline_3phase",
+        0.85,
+    )
+    add_audit_entry("Pipeline 3 phases", f"{removed_total} doublons supprimés, {len(corrections)} corrections")
+    st.session_state["dedup_pipeline_state"] = "done"
+
+
+def _dedup_create_backup(df: pd.DataFrame, source_name: str) -> str:
+    """Create backup of original data. Returns backup identifier. NEVER modifies original."""
+    ts = _now().strftime("%Y%m%d%H%M%S")
+    backup_key = f"DQ_BACKUP_{ts}"
+    st.session_state["dedup_backup_df"] = df.copy()
+    st.session_state["dedup_backup_name"] = backup_key
+    st.session_state["dedup_original_source"] = source_name
+    # Also persist to Snowflake for durability
+    backup_fqn = f"QUALITY_TEST.DATA_QUALITY.{backup_key}"
+    stage_dataframe_to_snowflake(df, backup_fqn)
+    return backup_fqn
+
+
+def _dedup_phase1_exact(df: pd.DataFrame, cols: list[str] | None = None) -> tuple[pd.DataFrame, list[dict]]:
+    """Phase 1: Detect exact duplicate rows by business key.
+    Finds rows sharing the same SIREN, or same normalized company name.
+    Returns (working_df_unchanged, groups_of_exact_duplicates)."""
+    work_cols = cols or list(df.columns)
+    groups = []
+    seen_indices = set()
+
+    # Identify key columns
+    _cols_lower = {c.lower(): c for c in work_cols}
+    siren_col = next((c for c in work_cols if "siren" in c.lower() and "siret" not in c.lower()), None)
+    name_col = next((c for c in work_cols if any(k in c.lower() for k in ("name", "nom", "company", "raison"))), None)
+
+    # Strategy A: Same SIREN = exact duplicate
+    if siren_col:
+        siren_norm = df[siren_col].fillna("").astype(str).str.strip().str.replace(r'\D', '', regex=True)
+        # Only consider valid SIRENs (9 digits, non-empty)
+        valid_mask = siren_norm.str.len() == 9
+        siren_groups = siren_norm[valid_mask].loc[siren_norm[valid_mask].duplicated(keep=False)]
+        if not siren_groups.empty:
+            for key, grp_idx in siren_groups.groupby(siren_norm[valid_mask]).groups.items():
+                if len(grp_idx) >= 2 and grp_idx[0] not in seen_indices:
+                    groups.append({
+                        "type": "exact",
+                        "indices": list(grp_idx),
+                        "count": len(grp_idx),
+                        "match_key": f"SIREN: {key}",
+                        "sample": df.iloc[grp_idx[0]][work_cols[:4]].to_dict(),
+                    })
+                    seen_indices.update(grp_idx)
+
+    # Strategy B: Same normalized company name (after removing legal forms, spaces, case)
+    if name_col:
+        _legal = re.compile(r'\b(SAS|SARL|SA|SCI|EURL|SNC|SASU|SE|GIE|EI|EARL)\b', re.IGNORECASE)
+        name_norm = (df[name_col].fillna("").astype(str)
+                     .str.strip().str.upper()
+                     .str.replace(r'\s+', ' ', regex=True)
+                     .apply(lambda x: _legal.sub('', x).strip()))
+        valid_names = name_norm[name_norm.str.len() >= 3]
+        name_dups = valid_names[valid_names.duplicated(keep=False)]
+        if not name_dups.empty:
+            for key, grp_idx in name_dups.groupby(valid_names).groups.items():
+                # Skip if all indices already seen
+                new_idx = [i for i in grp_idx if i not in seen_indices]
+                if len(new_idx) >= 2:
+                    groups.append({
+                        "type": "exact",
+                        "indices": list(grp_idx),
+                        "count": len(grp_idx),
+                        "match_key": f"Nom: {key[:40]}",
+                        "sample": df.iloc[grp_idx[0]][work_cols[:4]].to_dict(),
+                    })
+                    seen_indices.update(grp_idx)
+
+    return df, groups
+
+
+def _dedup_phase2_errors(df: pd.DataFrame, mapping: dict[str, str | None]) -> tuple[pd.DataFrame, list[dict]]:
+    """Phase 2: Detect formatting errors and propose corrections.
+    Returns (cleaned_df, list_of_corrections_applied)."""
+    corrections = []
+    df_work = df.copy()
+
+    # Normalize all string columns: strip whitespace, collapse multiple spaces
+    for col in df_work.columns:
+        if df_work[col].dtype == object:
+            original = df_work[col].copy()
+            df_work[col] = df_work[col].fillna("").astype(str).str.strip().str.replace(r'\s+', ' ', regex=True)
+            changed = (original.fillna("").astype(str) != df_work[col]) & (original.fillna("") != "")
+            if changed.any():
+                corrections.append({"col": col, "type": "whitespace", "count": int(changed.sum()),
+                                    "desc": f"Espaces normalisés dans '{col}'"})
+
+    # SIREN: pad to 9 digits if 8 digits
+    siren_col = mapping.get("siren")
+    if siren_col and siren_col in df_work.columns:
+        mask_8 = df_work[siren_col].astype(str).str.replace(r'\D', '', regex=True).str.len() == 8
+        if mask_8.any():
+            df_work.loc[mask_8, siren_col] = df_work.loc[mask_8, siren_col].astype(str).str.replace(r'\D', '', regex=True).str.zfill(9)
+            corrections.append({"col": siren_col, "type": "siren_pad", "count": int(mask_8.sum()),
+                                "desc": f"SIREN complété à 9 chiffres ({int(mask_8.sum())} lignes)"})
+
+    # SIRET: pad to 14 digits if 13 digits
+    siret_col = mapping.get("siret")
+    if siret_col and siret_col in df_work.columns:
+        mask_13 = df_work[siret_col].astype(str).str.replace(r'\D', '', regex=True).str.len() == 13
+        if mask_13.any():
+            df_work.loc[mask_13, siret_col] = df_work.loc[mask_13, siret_col].astype(str).str.replace(r'\D', '', regex=True).str.zfill(14)
+            corrections.append({"col": siret_col, "type": "siret_pad", "count": int(mask_13.sum()),
+                                "desc": f"SIRET complété à 14 chiffres ({int(mask_13.sum())} lignes)"})
+
+    # Company name: capitalize properly
+    name_col = mapping.get("company_name")
+    if name_col and name_col in df_work.columns:
+        # Detect all-uppercase names and convert to title case
+        mask_upper = df_work[name_col].str.isupper() & (df_work[name_col].str.len() > 3)
+        if mask_upper.any():
+            _before_samples = df_work.loc[mask_upper, name_col].head(5).tolist()
+            df_work.loc[mask_upper, name_col] = df_work.loc[mask_upper, name_col].str.title()
+            _after_samples = df_work.loc[mask_upper, name_col].head(5).tolist()
+            corrections.append({"col": name_col, "type": "case", "count": int(mask_upper.sum()),
+                                "desc": f"Noms convertis en casse titre ({int(mask_upper.sum())} lignes)",
+                                "samples_before": _before_samples, "samples_after": _after_samples})
+
+    return df_work, corrections
+
+def _dedup_phase3_similarity(df: pd.DataFrame, cols: list[str], threshold: float = 0.85, exclude_indices: set | None = None) -> list[dict]:
+    """Phase 3: Detect near-duplicates with 3-verdict logic.
+    CONFIRME = nom proche + meme ville -> fusion directe
+    A_VERIFIER = nom proche + villes differentes ou inconnues -> revue humaine"""
+    from difflib import SequenceMatcher
+    groups = []
+    seen = set(exclude_indices) if exclude_indices else set()
+
+    if not cols or df.empty:
+        return groups
+
+    max_rows = min(len(df), 2000)
+    df_sub = df.iloc[:max_rows]
+
+    # Identify key columns
+    name_col = None
+    siren_col = None
+    siret_col = None
+    city_col = None
+    address_col = None
+    for c in list(df.columns) + cols:
+        cl = c.lower()
+        if not name_col and any(k in cl for k in ("name", "nom", "company", "raison", "account_name")):
+            name_col = c
+        elif not siren_col and "siren" in cl and "siret" not in cl:
+            siren_col = c
+        elif not siret_col and "siret" in cl:
+            siret_col = c
+        elif not city_col and any(k in cl for k in ("city", "ville", "commune", "town")):
+            city_col = c
+        elif not address_col and any(k in cl for k in ("address", "adresse", "billing")):
+            address_col = c
+    if not name_col:
+        name_col = cols[0]
+
+    # Local Jaro-Winkler approximation for city comparison
+    def _jaro_city(s1: str, s2: str) -> int:
+        if not s1 or not s2:
+            return 0
+        s1, s2 = s1.upper().strip(), s2.upper().strip()
+        for suf in ("CEDEX", "CEDEX 1", "CEDEX 2", "CEDEX 9"):
+            s1 = s1.replace(suf, "").strip()
+            s2 = s2.replace(suf, "").strip()
+        if s1 == s2:
+            return 100
+        if s1 in s2 or s2 in s1:
+            return 92
+        len1, len2 = len(s1), len(s2)
+        if len1 == 0 or len2 == 0:
+            return 0
+        match_window = max(len1, len2) // 2 - 1
+        matches = 0
+        for i, c in enumerate(s1):
+            start_w = max(0, i - match_window)
+            end_w = min(len2, i + match_window + 1)
+            if c in s2[start_w:end_w]:
+                matches += 1
+        if matches == 0:
+            return 0
+        jaro = (matches / len1 + matches / len2 + 1.0) / 3.0
+        prefix = 0
+        for i in range(min(4, len1, len2)):
+            if s1[i] == s2[i]:
+                prefix += 1
+            else:
+                break
+        return int((jaro + prefix * 0.1 * (1 - jaro)) * 100)
+
+    # Get cities — robust NaN handling
+    _nan_variants = {"NAN", "NONE", "NULL", "NA", "N/A", "", "NANA", "INCONNU", "UNKNOWN"}
+    def _clean_city(v):
+        s = str(v).strip().upper()
+        for suf in ("CEDEX", "CEDEX 1", "CEDEX 2", "CEDEX 9"):
+            s = s.replace(suf, "").strip()
+        return "" if s in _nan_variants else s
+
+    cities = [_clean_city(df_sub[city_col].iloc[i]) if city_col and city_col in df_sub.columns else "" for i in range(max_rows)]
+
+    # Strategy 1: Same SIREN = CONFIRME
+    if siren_col and siren_col in df_sub.columns:
+        siren_vals = df_sub[siren_col].fillna("").astype(str).str.replace(r'\D', '', regex=True)
+        siren_groups = {}
+        for i, s in enumerate(siren_vals):
+            if i in seen or not s or len(s) != 9:
+                continue
+            siren_groups.setdefault(s, []).append(i)
+        for siren_val, indices in siren_groups.items():
+            if len(indices) >= 2:
+                # Same SIREN: check cities to distinguish establishments
+                city_a = cities[indices[0]] if indices[0] < len(cities) else ""
+                city_b = cities[indices[1]] if indices[1] < len(cities) else ""
+
+                # Villes différentes = établissements distincts → JAMAIS un doublon
+                if city_a and city_b:
+                    if _jaro_city(city_a, city_b) < 85:
+                        seen.update(indices)
+                        continue  # Different cities = NOT a duplicate
+                    # Same/similar city → confirmed duplicate
+                    groups.append({
+                        "type": "similar", "verdict": "CONFIRME",
+                        "indices": indices, "count": len(indices), "similarity": 99,
+                        "names": [str(df_sub.iloc[indices[0]].get(name_col, "")), str(df_sub.iloc[indices[1]].get(name_col, ""))],
+                        "cities": [city_a, city_b],
+                        "city_match": True, "reason": f"Même SIREN: {siren_val} · {city_a}",
+                    })
+                elif city_a or city_b:
+                    # One city known, one unknown → à vérifier
+                    groups.append({
+                        "type": "similar", "verdict": "A_VERIFIER",
+                        "indices": indices, "count": len(indices), "similarity": 99,
+                        "names": [str(df_sub.iloc[indices[0]].get(name_col, "")), str(df_sub.iloc[indices[1]].get(name_col, ""))],
+                        "cities": [city_a, city_b],
+                        "city_match": None, "reason": f"Même SIREN: {siren_val} — ville manquante",
+                    })
+                else:
+                    # Both cities unknown → à vérifier
+                    groups.append({
+                        "type": "similar", "verdict": "A_VERIFIER",
+                        "indices": indices, "count": len(indices), "similarity": 99,
+                        "names": [str(df_sub.iloc[indices[0]].get(name_col, "")), str(df_sub.iloc[indices[1]].get(name_col, ""))],
+                        "cities": [city_a, city_b],
+                        "city_match": None, "reason": f"Même SIREN: {siren_val} — villes inconnues",
+                    })
+                seen.update(indices)
+
+    # Strategy 2: Similar names with blocking
+    names = df_sub[name_col].fillna("").astype(str).str.strip().str.upper().tolist()
+    _legal = re.compile(r'\b(SAS|SARL|SA|SCI|EURL|SNC|SASU|SE|GIE|EI|EARL)\b')
+    names_norm = [_legal.sub('', n).strip() for n in names]
+
+    _siren_values = [""] * max_rows
+    if siren_col and siren_col in df_sub.columns:
+        _sv = df_sub[siren_col].fillna("").astype(str).str.replace(r'\D', '', regex=True).tolist()
+        _siren_values = [s if len(s) == 9 else "" for s in _sv]
+    if siret_col and siret_col in df_sub.columns:
+        _siret_v = df_sub[siret_col].fillna("").astype(str).str.replace(r'\D', '', regex=True).tolist()
+        for i, sv in enumerate(_siret_v):
+            if not _siren_values[i] and len(sv) >= 9:
+                _siren_values[i] = sv[:9]
+
+    blocks = {}
+    for i, n in enumerate(names_norm):
+        if i in seen or len(n) < 5 or n in ("NAN", "NONE", "NULL", "NA", "N/A", "NOM", ""):
+            continue
+        if not names[i] or names[i] in ("NAN", "NONE", "NULL", "NA", "N/A", ""):
+            continue
+        blocks.setdefault(n[:5], []).append(i)
+
+    _MAX_GROUPS = 30
+    _comparisons = 0
+    for block_indices in blocks.values():
+        if len(block_indices) < 2 or len(block_indices) > 20:
+            continue
+        if len(groups) >= _MAX_GROUPS or _comparisons >= 5000:
+            break
+        for i in range(len(block_indices)):
+            idx_i = block_indices[i]
+            if idx_i in seen:
+                continue
+            group_members = [idx_i]
+            for j in range(i + 1, len(block_indices)):
+                idx_j = block_indices[j]
+                if idx_j in seen:
+                    continue
+                s_i, s_j = _siren_values[idx_i], _siren_values[idx_j]
+                if s_i and s_j and s_i != s_j:
+                    continue
+                _comparisons += 1
+                sim = SequenceMatcher(None, names_norm[idx_i], names_norm[idx_j]).ratio()
+                if sim >= threshold:
+                    group_members.append(idx_j)
+                    seen.add(idx_j)
+            if len(group_members) >= 2:
+                seen.add(idx_i)
+                _sims = [SequenceMatcher(None, names_norm[idx_i], names_norm[m]).ratio() for m in group_members[1:]]
+                avg_sim = round((sum(_sims) / len(_sims)) * 100) if _sims else round(threshold * 100)
+
+                # 3-VERDICT: compare cities — villes différentes = JAMAIS un doublon
+                city_a = cities[idx_i] if idx_i < len(cities) else ""
+                city_b = cities[group_members[1]] if group_members[1] < len(cities) else ""
+
+                # Règle absolue : villes différentes = établissements distincts = pas un doublon
+                if city_a and city_b:
+                    if _jaro_city(city_a, city_b) < 85:
+                        # Different cities → NOT a duplicate, skip entirely
+                        continue
+                    verdict = "CONFIRME"
+                    city_match = True
+                    reason = city_a
+                elif city_a or city_b:
+                    # One city known, one unknown → user decides
+                    verdict = "A_VERIFIER"
+                    city_match = None
+                    reason = f"Ville connue: {city_a or city_b} — l'autre inconnue"
+                else:
+                    # Both unknown → user decides
+                    verdict = "A_VERIFIER"
+                    city_match = None
+                    reason = "Villes inconnues"
+
+                groups.append({
+                    "type": "similar", "verdict": verdict,
+                    "indices": group_members, "count": len(group_members),
+                    "similarity": avg_sim,
+                    "names": [names[idx_i], names[group_members[1]]],
+                    "cities": [city_a, city_b],
+                    "city_match": city_match, "reason": reason,
+                })
+    return groups
+
+
+def _dedup_apply_decisions(df: pd.DataFrame, accepted_groups: list[dict], strategy: str = "keep_first") -> tuple[pd.DataFrame, int]:
+    """Apply user-validated dedup decisions. Keep first/last of each accepted group.
+    Returns (cleaned_df, removed_count). NEVER touches original."""
+    indices_to_remove = set()
+    for grp in accepted_groups:
+        idxs = grp["indices"]
+        if strategy == "keep_last":
+            indices_to_remove.update(idxs[:-1])
+        else:
+            indices_to_remove.update(idxs[1:])
+    # Only remove indices that exist in the current DataFrame
+    valid_indices = indices_to_remove & set(df.index)
+    df_clean = df.drop(index=list(valid_indices)).reset_index(drop=True)
+    return df_clean, len(valid_indices)
+
+
+def deduplicate_dataframe(
+    df: pd.DataFrame,
+    mapping: dict[str, str | None],
+    keys: list[str],
+    strategy: str = "keep_first",
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Auto-deduplicate rows before analysis. Returns (clean_df, removed_df, stats)."""
+    if not keys or df.empty:
+        return df.copy(), pd.DataFrame(), {"original": len(df), "clean": len(df), "removed": 0, "dup_groups": 0}
+
+    def row_key(row):
+        parts = []
+        for k in keys:
+            col = mapping.get(k)
+            if col and col in row.index:
+                v = _cell_str(row[col])
+                if k in ("siren", "siret"):
+                    v = _digits_only(v)
+                parts.append(v.upper() if v else "")
+            else:
+                parts.append("")
+        return tuple(parts)
+
+    df_work = df.copy()
+    df_work["_dedup_key"] = df_work.apply(row_key, axis=1)
+    has_key = df_work["_dedup_key"].apply(lambda k: any(p for p in k))
+    dup_groups = df_work[has_key & df_work["_dedup_key"].duplicated(keep=False)]["_dedup_key"].nunique()
+
+    if strategy == "keep_last":
+        keep = ~df_work["_dedup_key"].duplicated(keep="last") | ~has_key
+    else:
+        keep = ~df_work["_dedup_key"].duplicated(keep="first") | ~has_key
+
+    clean = df_work[keep].drop(columns=["_dedup_key"])
+    removed = df_work[~keep].drop(columns=["_dedup_key"])
+    return clean, removed, {
+        "original": len(df),
+        "clean": len(clean),
+        "removed": len(removed),
+        "dup_groups": int(dup_groups),
+        "keys": keys,
+        "strategy": strategy,
+    }
+
+
+def deduplicate_snowflake_table(
+    table_fqn: str, mapping: dict[str, str | None], keys: list[str], strategy: str = "keep_first",
+) -> tuple[pd.DataFrame, dict]:
+    """Run deduplication in Snowflake SQL, return cleaned dataframe + stats."""
+    if not keys or not _get_conn():
+        df = load_table_as_dataframe(table_fqn)
+        return df, {"original": len(df), "clean": len(df), "removed": 0, "dup_groups": 0, "engine": "local"}
+
+    partition_cols = []
+    for k in keys:
+        col = mapping.get(k)
+        if col:
+            if k in ("siren", "siret"):
+                partition_cols.append(f"REGEXP_REPLACE(COALESCE({col}, ''), '[^0-9]', '')")
+            else:
+                partition_cols.append(f"UPPER(TRIM(COALESCE({col}, '')))")
+
+    if not partition_cols:
+        df = load_table_as_dataframe(table_fqn)
+        return df, {"original": len(df), "clean": len(df), "removed": 0, "dup_groups": 0, "engine": "local"}
+
+    order_col = mapping.get("account_id") or mapping.get("siren") or next(c for c in mapping.values() if c)
+    order_dir = "DESC" if strategy == "keep_last" else "ASC"
+    partition_expr = ", ".join(partition_cols)
+    staging_clean = f"{STAGING_TABLE}_CLEAN"
+    where_parts = [f"COALESCE({mapping[k]}, '') <> ''" for k in keys if mapping.get(k)]
+    where_clause = " OR ".join(where_parts) if where_parts else "1=1"
+
+    sql = f"""
+        CREATE OR REPLACE TRANSIENT TABLE {staging_clean} AS
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY {partition_expr}
+                ORDER BY {order_col} {order_dir}
+            ) AS _rn
+            FROM {table_fqn}
+            WHERE {where_clause}
+        ) WHERE _rn = 1
+    """
+    _sf_execute(sql)
+    df_orig = load_table_as_dataframe(table_fqn)
+    df_clean = load_table_as_dataframe(staging_clean)
+    removed = max(0, len(df_orig) - len(df_clean))
+    return df_clean, {
+        "original": len(df_orig),
+        "clean": len(df_clean),
+        "removed": removed,
+        "dup_groups": removed,
+        "keys": keys,
+        "strategy": strategy,
+        "engine": "snowflake",
+        "staging_table": staging_clean,
+    }
+
+
+def stage_dataframe_to_snowflake(df: pd.DataFrame, table_fqn: str = STAGING_TABLE) -> bool:
+    """Upload a dataframe to a Snowflake table (fast: write_pandas or parameterized INSERT)."""
+    conn = _get_conn()
+    if conn is None or df.empty:
+        return False
+    parts = table_fqn.split(".")
+    if len(parts) != 3:
+        return False
+    database, schema, table = parts
+    # Clean column names for Snowflake compatibility
+    df = df.copy()
+    df.columns = [c.upper().replace(" ", "_").replace("-", "_") for c in df.columns]
+    # Replace NaN with None for proper NULL handling
+    df = df.where(df.notna(), None)
+    try:
+        from snowflake.connector.pandas_tools import write_pandas
+        conn.cursor().execute(f"USE DATABASE {database}")
+        conn.cursor().execute(f"USE SCHEMA {schema}")
+        success, _, nrows, _ = write_pandas(
+            conn, df, table.upper(),
+            database=database, schema=schema,
+            auto_create_table=True, overwrite=True,
+            quote_identifiers=False,
+        )
+        if success and nrows and nrows[0] >= len(df) * 0.95:
+            return True
+        # If write_pandas lost too many rows, fall through to parameterized INSERT
+    except Exception:
+        pass
+
+    # Fallback: CREATE TABLE + parameterized INSERT (handles all special characters)
+    try:
+        cols_ddl = ", ".join(f'"{c}" VARCHAR' for c in df.columns)
+        conn.cursor().execute(f"CREATE OR REPLACE TABLE {table_fqn} ({cols_ddl})")
+        col_list = ", ".join(f'"{c}"' for c in df.columns)
+        placeholders = ", ".join(["%s"] * len(df.columns))
+        cur = conn.cursor()
+        batch_size = 100
+        for start in range(0, len(df), batch_size):
+            chunk = df.iloc[start:start + batch_size]
+            rows_data = []
+            for _, row in chunk.iterrows():
+                rows_data.append(tuple(str(v) if v is not None else None for v in row))
+            try:
+                cur.executemany(
+                    f"INSERT INTO {table_fqn} ({col_list}) VALUES ({placeholders})",
+                    rows_data
+                )
+            except Exception:
+                # Row-by-row fallback for truly problematic rows
+                for row_tuple in rows_data:
+                    try:
+                        cur.execute(
+                            f"INSERT INTO {table_fqn} ({col_list}) VALUES ({placeholders})",
+                            row_tuple
+                        )
+                    except Exception:
+                        pass
+        return True
+    except Exception:
+        return False
+
+
+def _quick_score(df: pd.DataFrame, mapping: dict[str, str | None]) -> int:
+    """Fast conformity score estimate (% rows without obvious format issues). Fully vectorized."""
+    if df.empty:
+        return 0
+    issues_mask = pd.Series(False, index=df.index)
+    siren_col = mapping.get("siren")
+    siret_col = mapping.get("siret")
+    if siren_col and siren_col in df.columns:
+        s = df[siren_col].fillna("").astype(str).str.strip().str.replace(r'\D', '', regex=True)
+        has_siren = s != ""
+        siren_bad = has_siren & (s.str.len() != 9)
+        issues_mask = issues_mask | siren_bad
+    if siret_col and siret_col in df.columns:
+        t = df[siret_col].fillna("").astype(str).str.strip().str.replace(r'\D', '', regex=True)
+        has_siret = t != ""
+        siret_bad = has_siret & (t.str.len() != 14)
+        issues_mask = issues_mask | siret_bad
+    ok = int((~issues_mask).sum())
+    return round(ok / len(df) * 100)
+
+
+def run_snowflake_dq_analysis(
+    table_fqn: str,
+    mapping: dict[str, str | None],
+    enabled_rules: list[str] | None = None,
+    dedup_keys: list[str] | None = None,
+    auto_dedup: bool = True,
+    dedup_strategy: str = "keep_first",
+    custom_rules: list[dict] | None = None,
+    join_config: dict | None = None,
+    df_override: pd.DataFrame | None = None,
+    skip_name_search: bool = False,
+) -> tuple[list[dict], dict, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Run DQ analysis on Snowflake: load/stage table, dedup in SQL, apply rules.
+    Supports optional JOIN with a secondary table via join_config.
+    If df_override is provided, uses it instead of loading from Snowflake.
+    Returns (anomalies, stats, df_original, df_clean, df_removed).
+    """
+    if df_override is not None:
+        df_orig = df_override.copy()
+        if df_orig.empty:
+            return [], {"total_rows": 0, "anomaly_count": 0, "score": 0}, df_orig, df_orig, pd.DataFrame()
+    elif join_config:
+        sec = join_config["table"]
+        jtype = join_config["join_type"]
+        ka = join_config["key_primary"]
+        kb = join_config["key_secondary"]
+        query = f"SELECT a.*, b.* EXCLUDE ({kb}) FROM {table_fqn} a {jtype} {sec} b ON a.{ka} = b.{kb}"
+        df_orig = pd.DataFrame(_sf_query(query))
+        if df_orig.empty:
+            return [], {"total_rows": 0, "anomaly_count": 0, "score": 0}, df_orig, df_orig, pd.DataFrame()
+        df_orig.columns = [c.lower() for c in df_orig.columns]
+    else:
+        df_orig = load_table_as_dataframe(table_fqn)
+        if df_orig.empty:
+            return [], {"total_rows": 0, "anomaly_count": 0, "score": 0}, df_orig, df_orig, pd.DataFrame()
+
+    if not mapping or not any(mapping.values()):
+        mapping = _mapping_for_table(table_fqn, list(df_orig.columns))
+
+    dedup_keys = dedup_keys or DEFAULT_DEDUP_KEYS
+    df_removed = pd.DataFrame()
+    dedup_stats: dict = {}
+
+    # Skip dedup + staging if df_override is already cleaned (from wizard Step 3)
+    if df_override is not None:
+        df_clean = df_orig
+    elif auto_dedup and dedup_keys:
+        df_clean, dedup_stats = deduplicate_snowflake_table(table_fqn, mapping, dedup_keys, dedup_strategy)
+        if dedup_stats.get("engine") == "local":
+            df_clean, df_removed, dedup_stats = deduplicate_dataframe(df_orig, mapping, dedup_keys, dedup_strategy)
+    else:
+        df_clean = df_orig.copy()
+
+    # Only stage to Snowflake if not using override (avoid slow upload)
+    if df_override is None:
+        stage_dataframe_to_snowflake(df_clean, STAGING_TABLE)
+    score_before = _quick_score(df_orig.head(200), mapping)  # Sample for speed
+
+    rule_ids = enabled_rules or [r["id"] for r in FR_BUSINESS_RULES] + ["INSEE"]
+    anomalies, stats = analyze_uploaded_dataframe(
+        df_clean, mapping, source="snowflake",
+        enabled_rules=rule_ids, skip_duplicate_check=auto_dedup,
+        custom_rules=custom_rules or [], skip_name_search=skip_name_search,
+    )
+    stats["dedup"] = dedup_stats
+    stats["score_before"] = score_before
+    stats["active_rules"] = sorted(set(rule_ids))
+    stats["engine"] = "snowflake"
+    stats["source_table"] = table_fqn
+    st.session_state["fr_clean_df"] = df_clean
+    st.session_state["fr_removed_df"] = df_removed
+    return anomalies, stats, df_orig, df_clean, df_removed
+
+
+def _render_rules_and_dedup_config(key_prefix: str = "fr"):
+    """Compact rule config — interactive checkboxes in a styled grid."""
+    t = get_theme()
+
+    # All rules including INSEE
+    all_rules = FR_BUSINESS_RULES + [
+        {"id": "INSEE", "name": "Registre SIRENE", "check": "29M+ entreprises"}
+    ]
+
+    # Render interactive checkboxes in 3-column grid
+    cols = st.columns(3)
+    for i, rule in enumerate(all_rules):
+        with cols[i % 3]:
+            st.checkbox(
+                f"**{rule['id']}** — {rule['name']}",
+                value=st.session_state.get(f"{key_prefix}_rule_{rule['id']}", True),
+                key=f"{key_prefix}_rule_{rule['id']}",
+            )
+
+    enabled = [rule["id"] for rule in all_rules if st.session_state.get(f"{key_prefix}_rule_{rule['id']}", True)]
+
+    st.session_state[f"{key_prefix}_enabled_rules"] = enabled
+    return enabled
+
+
+def _render_cleaning_preview(stats: dict, df_clean: pd.DataFrame, df_removed: pd.DataFrame):
+    """Show before/after dedup scores and cleaned data preview."""
+    dedup = stats.get("dedup", {})
+    if not dedup.get("removed"):
+        return
+
+    section_header("Aperçu nettoyage", "Résultat du dédoublonnage automatique avant analyse.", icon="✦")
+    score_before = stats.get("score_before", stats.get("score", 0))
+    score_after = stats.get("score", 0)
+    keys_label = ", ".join(DEDUP_KEY_OPTIONS.get(k, k) for k in dedup.get("keys", []))
+    st.markdown(
+        '<div class="qx-kpi-grid qx-kpi-grid-auto">'
+        + kpi_card("Lignes originales", str(dedup.get("original", 0)), keys_label, "neutral")
+        + kpi_card("Doublons supprimés", str(dedup.get("removed", 0)), f"{dedup.get('dup_groups', 0)} groupe(s)", "down")
+        + kpi_card("Lignes nettoyées", str(dedup.get("clean", 0)), DEDUP_STRATEGIES.get(dedup.get("strategy", ""), ""), "neutral")
+        + kpi_card("Score avant", f"{score_before}%", "Estimation format", "neutral")
+        + kpi_card("Score après", f"{score_after}%", "Post-nettoyage", "up" if score_after >= score_before else "down")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+    tab_clean, tab_removed = st.tabs(["Données nettoyées (aperçu)", "Lignes supprimées (doublons)"])
+    with tab_clean:
+        st.dataframe(df_clean.head(20), use_container_width=True, hide_index=True)
+    with tab_removed:
+        if df_removed.empty:
+            st.caption("Détail des lignes supprimées non disponible (dédoublonnage Snowflake SQL).")
+        else:
+            st.dataframe(df_removed.head(20), use_container_width=True, hide_index=True)
+
+
+def _render_bulk_action_table(items: list[dict], on_accept, on_reject, key_prefix: str = "bulk"):
+    """Premium bulk action table with toolbar."""
+    if not items:
+        return
+
+    sel_key = f"{key_prefix}_selected"
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = set()
+
+    sel: set = st.session_state[sel_key]
+    st.markdown(
+        f'<div class="qx-bulk-header">'
+        f'<div class="qx-bulk-title">Actions groupées</div>'
+        f'<div class="qx-bulk-meta">{len(items)} élément(s) · {len(sel)} sélectionné(s)</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
+    with bc1:
+        if st.button("☑ Tout sélectionner", key=f"{key_prefix}_all", use_container_width=True):
+            st.session_state[sel_key] = {a["id"] for a in items}
+            st.rerun()
+    with bc2:
+        if st.button("☐ Tout désélectionner", key=f"{key_prefix}_none", use_container_width=True):
+            st.session_state[sel_key] = set()
+            st.rerun()
+    with bc3:
+        if st.button(f"✓ Accepter ({len(sel)})", key=f"{key_prefix}_bulk_acc", type="primary", disabled=not sel, use_container_width=True):
+            count = len(sel)
+            for aid in list(sel):
+                on_accept(aid)
+            st.session_state[sel_key] = set()
+            st.toast(f"✓ {count} anomalie(s) acceptée(s)")
+            st.rerun()
+    with bc4:
+        if st.button(f"✗ Rejeter ({len(sel)})", key=f"{key_prefix}_bulk_rej", disabled=not sel, use_container_width=True):
+            st.session_state[f"{key_prefix}_bulk_rej_open"] = True
+
+    if st.session_state.get(f"{key_prefix}_bulk_rej_open") and sel:
+        st.markdown('<div class="qx-reject-bar">', unsafe_allow_html=True)
+        reason = st.text_input("Motif de rejet groupé", key=f"{key_prefix}_rej_reason", placeholder="Non applicable")
+        if st.button("Confirmer le rejet groupé", key=f"{key_prefix}_confirm_rej", type="primary"):
+            count = len(sel)
+            for aid in list(sel):
+                on_reject(aid, reason or "Rejet groupé")
+            st.session_state[sel_key] = set()
+            st.session_state.pop(f"{key_prefix}_bulk_rej_open", None)
+            st.toast(f"✗ {count} anomalie(s) rejetée(s)")
+            st.rerun()
+
+    st.markdown('<div class="qx-data-shell">', unsafe_allow_html=True)
+    rows = []
+    for a in items:
+        rows.append({
+            "Sélectionner": a["id"] in sel,
+            "ID": a.get("id", ""),
+            "Compte": a.get("company_name", "")[:40],
+            "Règle": a.get("rule_id", ""),
+            "Sévérité": TR_SEVERITY.get(a.get("severity", ""), a.get("severity", "")),
+            "Champ": a.get("field_label", a.get("field", "")),
+            "Valeur actuelle": _safe_display(a.get("field_value", ""), "—")[:50],
+            "Valeur attendue": _safe_display(a.get("expected_value", ""), "—")[:50],
+        })
+
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        hide_index=True,
+        use_container_width=True,
+        key=f"{key_prefix}_editor",
+        column_config={"Sélectionner": st.column_config.CheckboxColumn(default=False, required=True)},
+        disabled=["ID", "Compte", "Règle", "Sévérité", "Champ", "Valeur actuelle", "Valeur attendue"],
+    )
+
+    new_sel = {items[i]["id"] for i, row in edited.iterrows() if row["Sélectionner"]}
+    if new_sel != sel:
+        st.session_state[sel_key] = new_sel
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# CSS / helpers
+# ---------------------------------------------------------------------------
+
+
+def get_theme():
+    return THEMES[st.session_state.get("theme", "light")]
+
+
+def inject_css():
+    t = get_theme()
+    is_light = st.session_state.get("theme", "dark") == "light"
+    shadow = "none" if not is_light else "0 1px 3px rgba(0,0,0,0.08)"
+    color_scheme = "light" if is_light else "dark"
+
+    widget_shell = f"""
+        /* Sélection texte — Leon accent */
+        ::selection {{
+            background: {t['accent_soft']} !important;
+            color: {t['text_primary']} !important;
+        }}
+
+        /* Labels widgets — pas de fond bleu */
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] label,
+        [data-testid="stRadio"] label,
+        [data-testid="stCheckbox"] label,
+        [data-testid="stSelectbox"] label,
+        [data-testid="stFileUploader"] label,
+        [data-testid="stTextInput"] label {{
+            color: {t['text_primary']} !important;
+            background: transparent !important;
+        }}
+
+        /* Radio & checkbox */
+        [data-testid="stRadio"] [data-baseweb="radio"],
+        [data-testid="stRadio"] label[data-baseweb="radio"],
+        [data-testid="stCheckbox"] label[data-baseweb="checkbox"] {{
+            background: transparent !important;
+        }}
+        [data-testid="stRadio"] label[data-baseweb="radio"] > div:last-child,
+        [data-testid="stCheckbox"] label[data-baseweb="checkbox"] > div:last-child {{
+            color: {t['text_primary']} !important;
+            background: transparent !important;
+        }}
+        [data-testid="stRadio"] label[data-baseweb="radio"]:focus,
+        [data-testid="stRadio"] label[data-baseweb="radio"]:focus-within,
+        [data-testid="stCheckbox"] label[data-baseweb="checkbox"]:focus,
+        [data-testid="stCheckbox"] label[data-baseweb="checkbox"]:focus-within {{
+            background: transparent !important;
+            outline: none !important;
+        }}
+
+        /* Onglets */
+        [data-testid="stTabs"] [data-baseweb="tab-list"] button {{
+            color: {t['text_secondary']} !important;
+            background: transparent !important;
+        }}
+        [data-testid="stTabs"] [data-baseweb="tab-list"] button[aria-selected="true"] {{
+            color: {t['accent']} !important;
+            border-bottom-color: {t['accent']} !important;
+        }}
+        [data-testid="stTabs"] [data-baseweb="tab-highlight"] {{
+            background-color: {t['accent']} !important;
+        }}
+
+        /* Toggle sidebar */
+        [data-testid="stSidebar"] [data-testid="stToggle"] label span {{
+            color: {t['text_primary']} !important;
+        }}
+
+        /* Expander */
+        [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] summary span {{
+            color: {t['text_primary']} !important;
+            background: transparent !important;
+        }}
+
+        /* Info / success / warning boxes */
+        [data-testid="stAlert"] {{
+            background-color: {"#f8fafc" if is_light else "#1e2028"} !important;
+            color: {t['text_primary']} !important;
+            border: 1px solid {t['border']} !important;
+        }}
+    """
+
+    light_widgets = ""
+    if is_light:
+        light_widgets = f"""
+        /* Mode clair — champs & boutons */
+        [data-testid="stTextInput"] [data-baseweb="base-input"],
+        [data-testid="stTextInput"] [data-baseweb="input"],
+        [data-testid="stTextArea"] [data-baseweb="base-input"],
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] [data-baseweb="base-input"],
+        [data-testid="stDateInput"] [data-baseweb="base-input"],
+        [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+        [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"],
+        [data-testid="stFileUploader"] section {{
+            background-color: #ffffff !important;
+            border-color: {t['border']} !important;
+        }}
+        [data-testid="stTextInput"] input,
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stSelectbox"] [data-baseweb="select"] span,
+        [data-testid="stMultiSelect"] [data-baseweb="select"] span {{
+            color: {t['text_primary']} !important;
+            -webkit-text-fill-color: {t['text_primary']} !important;
+        }}
+        [data-testid="stTextInput"] input::placeholder {{
+            color: {t['text_secondary']} !important;
+            opacity: 1;
+        }}
+
+        .main [data-testid="stButton"] > button,
+        .main .stButton > button {{
+            background-color: #ffffff !important;
+            color: {t['text_primary']} !important;
+            border: 1px solid {t['border']} !important;
+            box-shadow: none !important;
+        }}
+        .main [data-testid="stButton"] > button:hover,
+        .main .stButton > button:hover {{
+            background-color: #f8fafc !important;
+            border-color: {t['accent']} !important;
+            color: {t['accent']} !important;
+        }}
+        .main [data-testid="stButton"] > button[kind="primary"],
+        .main .stButton > button[kind="primary"] {{
+            background-color: {t['accent']} !important;
+            color: #ffffff !important;
+            border: none !important;
+        }}
+        .main [data-testid="stButton"] > button[kind="primary"]:hover,
+        .main .stButton > button[kind="primary"]:hover {{
+            background-color: #0f766e !important;
+            color: #ffffff !important;
+        }}
+        """
+    else:
+        light_widgets = f"""
+        /* Mode sombre — widgets (config.toml = light, on re-sombre les contrôles) */
+        [data-testid="stTextInput"] [data-baseweb="base-input"],
+        [data-testid="stTextInput"] [data-baseweb="input"],
+        [data-testid="stTextArea"] [data-baseweb="base-input"],
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] [data-baseweb="base-input"],
+        [data-testid="stDateInput"] [data-baseweb="base-input"],
+        [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+        [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"],
+        [data-testid="stFileUploader"] section {{
+            background-color: {t['card_bg']} !important;
+            border-color: {t['border']} !important;
+        }}
+        [data-testid="stTextInput"] input,
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stSelectbox"] [data-baseweb="select"] span,
+        [data-testid="stMultiSelect"] [data-baseweb="select"] span {{
+            color: {t['text_primary']} !important;
+            -webkit-text-fill-color: {t['text_primary']} !important;
+        }}
+
+        .main [data-testid="stButton"] > button,
+        .main .stButton > button {{
+            background-color: {t['card_bg']} !important;
+            color: {t['text_primary']} !important;
+            border: 1px solid {t['border']} !important;
+            box-shadow: none !important;
+        }}
+        .main [data-testid="stButton"] > button:hover,
+        .main .stButton > button:hover {{
+            border-color: {t['accent']} !important;
+            color: {t['accent']} !important;
+        }}
+        .main [data-testid="stButton"] > button[kind="primary"],
+        .main .stButton > button[kind="primary"] {{
+            background-color: {t['accent']} !important;
+            color: #1a1d23 !important;
+            border: none !important;
+        }}
+        """
+
+    st.markdown(
+        f"""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        :root {{
+            --sidebar-bg: {t['sidebar_bg']};
+            --content-bg: {t['content_bg']};
+            --card-bg: {t['card_bg']};
+            --card-bg-elevated: {t.get('card_bg_elevated', t['card_bg'])};
+            --border: {t['border']};
+            --border-subtle: {t.get('border_subtle', t['border'])};
+            --text-primary: {t['text_primary']};
+            --text-secondary: {t['text_secondary']};
+            --accent: {t['accent']};
+            --accent-soft: {t['accent_soft']};
+            --high: {t['high']};
+            --medium: {t['medium']};
+            --low: {t['low']};
+            --success: {t['success']};
+            --radius-sm: 8px;
+            --radius-md: 16px;
+            --radius-lg: 16px;
+            --shadow-card: {"0 1px 3px rgba(0,0,0,0.08)" if is_light else "0 4px 24px rgba(0,0,0,0.35)"};
+            --shadow-glow: 0 0 40px {t['accent_glow']};
+        }}
+
+        html, body, [class*="css"] {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+        }}
+
+        /* App shell */
+        .stApp {{
+            background: var(--content-bg) !important;
+            background-image: {t.get('gradient_hero', 'none')} !important;
+            background-size: 100% 420px !important;
+            background-repeat: no-repeat !important;
+            color: var(--text-primary) !important;
+            color-scheme: {color_scheme};
+        }}
+        {light_widgets}
+        {widget_shell}
+
+        .main .block-container {{ padding-top: 1rem; max-width: 1440px; color: var(--text-primary) !important; }}
+        .main [data-testid="stVerticalBlock"] > div {{
+            gap: 0.25rem !important;
+        }}
+
+        /* Texte markdown — pas les divs internes des widgets */
+        .main [data-testid="stMarkdownContainer"] p,
+        .main [data-testid="stMarkdownContainer"] span,
+        .main [data-testid="stMarkdownContainer"] li,
+        .main [data-testid="stMarkdownContainer"] strong {{
+            color: var(--text-primary) !important;
+        }}
+        .main [data-testid="stCaptionContainer"],
+        .main [data-testid="stCaptionContainer"] p {{
+            color: var(--text-secondary) !important;
+        }}
+        h1, h2, h3, h4, h5, h6,
+        .main h1, .main h2, .main h3 {{
+            color: var(--text-primary) !important;
+        }}
+        [data-testid="stMetricLabel"] {{
+            color: var(--text-secondary) !important;
+        }}
+        [data-testid="stMetricValue"] {{
+            color: var(--text-primary) !important;
+        }}
+        [data-testid="stMetricDelta"] svg {{
+            fill: var(--text-secondary) !important;
+        }}
+        [data-testid="stMetricDelta"] {{
+            color: var(--text-secondary) !important;
+        }}
+
+        /* ===== SIDEBAR — always dark navy ===== */
+        [data-testid="stSidebar"],
+        section[data-testid="stSidebar"],
+        section[data-testid="stSidebar"] > div {{
+            background-color: {t['sidebar_bg']} !important;
+            background: {t['sidebar_bg']} !important;
+        }}
+        section[data-testid="stSidebar"] > div {{
+            padding-top: 0 !important;
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stSidebarHeader"] {{
+            padding: 0 !important;
+            min-height: 0 !important;
+            height: 0 !important;
+            display: none !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] {{
+            top: 4px !important;
+        }}
+        [data-testid="stSidebar"] {{
+            border-right: 1px solid rgba(255,255,255,0.06) !important;
+        }}
+        /* All sidebar text = light */
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] div,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] span,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] strong,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 {{
+            color: {t['sidebar_text']} !important;
+        }}
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] label span,
+        [data-testid="stSidebar"] label p {{
+            color: {t['sidebar_text']} !important;
+        }}
+        [data-testid="stSidebar"] hr {{
+            border-color: rgba(255,255,255,0.08) !important;
+            margin: 8px 0 !important;
+        }}
+        /* COMPACT sidebar — breathable gaps */
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{
+            gap: 4px !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div {{
+            gap: 4px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div > div {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stSidebar"] .element-container {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stSidebar"] .stButton {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        /* Sidebar columns (badge rows) need alignment */
+        [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {{
+            gap: 0 !important;
+            align-items: center !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {{
+            padding: 0 !important;
+            margin: 0 !important;
+        }}
+        /* Sidebar nav buttons */
+        [data-testid="stSidebar"] .stButton > button {{
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            text-align: left;
+            padding: 10px 14px !important;
+            margin: 2px 0 !important;
+            border-radius: 6px !important;
+            color: {t['nav_inactive']} !important;
+            font-size: 0.85rem;
+            font-weight: 400;
+            justify-content: flex-start;
+            width: 100%;
+            min-height: 0 !important;
+            height: auto !important;
+            line-height: 1.4;
+        }}
+        [data-testid="stSidebar"] .stButton > button:hover {{
+            background: {t['nav_hover']} !important;
+            color: {t['sidebar_text']} !important;
+        }}
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+            background: rgba(255,255,255,0.05) !important;
+            color: {t['accent']} !important;
+            font-weight: 600;
+            border-left: 3px solid {t['accent']} !important;
+            border-radius: 0 6px 6px 0 !important;
+        }}
+        [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {{
+            color: {t['accent']} !important;
+            background: rgba(255,255,255,0.08) !important;
+        }}
+        /* Sidebar CTA button (first primary button = Lancer l'analyse) — filled green */
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:first-child .stButton > button[kind="primary"],
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:nth-child(2) .stButton > button[kind="primary"] {{
+            background: linear-gradient(135deg,#0E9C8A,#1BD1B4) !important;
+            color: #fff !important;
+            border: none !important;
+            border-left: none !important;
+            border-radius: 10px !important;
+            padding: 12px 14px !important;
+            font-weight: 700 !important;
+            font-size: 0.88rem !important;
+            margin-bottom: 4px !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:first-child .stButton > button[kind="primary"]:hover,
+        [data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:nth-child(2) .stButton > button[kind="primary"]:hover {{
+            background: linear-gradient(135deg,#0c8a7a,#17b89e) !important;
+            color: #fff !important;
+        }}
+        [data-testid="stSidebar"] .stButton > button span[data-testid="stIconMaterial"] {{
+            color: {t['nav_inactive']} !important;
+        }}
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] span[data-testid="stIconMaterial"] {{
+            color: {t['accent']} !important;
+        }}
+        [data-testid="stSidebar"] .stColumn {{
+            padding: 0 !important;
+        }}
+        /* Sidebar toggle label */
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {{
+            color: {t['sidebar_text']} !important;
+        }}
+
+        /* Cards & metrics */
+        div[data-testid="metric-container"] {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: {shadow};
+        }}
+        .qx-card {{
+            background: var(--card-bg);
+            background-image: {t.get('gradient_card', 'none')};
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 14px 18px;
+            margin-bottom: 10px;
+            box-shadow: var(--shadow-card);
+            color: var(--text-primary);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }}
+        .qx-card:hover {{
+            border-color: {"#cbd5e1" if is_light else "#353849"};
+        }}
+        .qx-card strong {{ color: var(--text-primary) !important; }}
+        .qx-card span {{ color: inherit; }}
+
+        /* Page header */
+        .qx-page-header {{
+            position: relative;
+            margin: -0.5rem 0 0.75rem 0;
+            padding: 1rem 0 0.75rem 0;
+            border-bottom: 1px solid var(--border);
+        }}
+        .qx-page-header-glow {{
+            display: none;
+        }}
+        .qx-page-title {{
+            font-size: 1.6rem; font-weight: 800; letter-spacing: -0.02em;
+            color: var(--text-primary) !important; margin: 0; line-height: 1.2;
+        }}
+        .qx-page-sub {{
+            font-size: 0.88rem; color: var(--text-secondary) !important;
+            margin: 4px 0 0 0; max-width: 640px; line-height: 1.4;
+        }}
+        .qx-page-badges {{ margin-top: 8px; }}
+        .qx-page-badge {{
+            display: inline-block; padding: 4px 12px; margin-right: 8px;
+            border-radius: 999px; font-size: 0.72rem; font-weight: 600;
+            background: var(--accent-soft); color: var(--accent);
+            border: 1px solid {t['accent_soft']}; letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }}
+
+        /* Section header */
+        .qx-section-head {{
+            display: flex; align-items: flex-start; gap: 12px;
+            margin: 0.75rem 0 0.5rem 0; padding-bottom: 8px;
+            border-bottom: 1px solid var(--border-subtle);
+        }}
+        .qx-section-icon {{
+            display: flex; align-items: center; justify-content: center;
+            width: 36px; height: 36px; border-radius: 10px;
+            background: var(--accent-soft); color: var(--accent);
+            font-size: 1rem; flex-shrink: 0;
+        }}
+        .qx-section-title {{
+            font-size: 1.05rem; font-weight: 700; color: var(--text-primary);
+            letter-spacing: -0.01em;
+        }}
+        .qx-section-sub {{
+            font-size: 0.82rem; color: var(--text-secondary); margin-top: 3px;
+        }}
+
+        /* Bulk action toolbar */
+        .qx-bulk-header {{
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 12px;
+        }}
+        .qx-bulk-title {{ font-size: 0.95rem; font-weight: 700; color: var(--text-primary); }}
+        .qx-bulk-meta {{ font-size: 0.8rem; color: var(--text-secondary); }}
+        .qx-data-shell {{
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-md); padding: 4px; margin-top: 8px;
+            box-shadow: var(--shadow-card);
+        }}
+        .qx-reject-bar {{
+            background: rgba(239,68,68,0.06); border: 1px solid rgba(239,68,68,0.2);
+            border-radius: var(--radius-sm); padding: 12px 16px; margin: 8px 0;
+        }}
+
+        /* Info chips & empty states */
+        .qx-info-chip {{
+            background: var(--accent-soft); border: 1px solid {t['accent_soft']};
+            border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 12px;
+        }}
+        .qx-info-chip-title {{ display: block; font-weight: 700; font-size: 0.88rem; color: var(--text-primary); }}
+        .qx-info-chip-desc {{ display: block; font-size: 0.78rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.4; }}
+        .qx-empty-state {{
+            text-align: center; padding: 28px 20px; color: var(--text-secondary);
+            font-size: 0.88rem; border: 1px dashed var(--border);
+            border-radius: var(--radius-sm); margin: 12px 0;
+        }}
+        .qx-custom-rule-row {{
+            padding: 10px 14px; margin: 6px 0; background: var(--border-subtle);
+            border-radius: var(--radius-sm); border: 1px solid var(--border);
+            font-size: 0.88rem;
+        }}
+
+        /* Badges */
+        .qx-badge {{
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }}
+        .qx-badge-high {{ background: rgba(239,68,68,0.15); color: {t['high']}; }}
+        .qx-badge-medium {{ background: rgba(217,119,6,0.12); color: {t['medium']}; }}
+        .qx-badge-low {{ background: rgba(59,130,246,0.15); color: {t['low']}; }}
+        .qx-badge-open {{ background: rgba(239,68,68,0.12); color: {t['high']}; }}
+        .qx-badge-review {{ background: {t['accent_soft']}; color: {t['medium']}; }}
+        .qx-badge-resolved {{ background: rgba(34,197,94,0.12); color: {t['success']}; }}
+        .qx-badge-dismissed {{ background: rgba(139,141,151,0.15); color: {t['text_secondary']}; }}
+        .qx-badge-p1 {{ background: rgba(239,68,68,0.15); color: {t['high']}; }}
+        .qx-badge-p2 {{ background: rgba(217,119,6,0.12); color: {t['medium']}; }}
+        .qx-badge-p3 {{ background: rgba(59,130,246,0.15); color: {t['low']}; }}
+        .qx-badge-match {{ background: rgba(34,197,94,0.15); color: {t['success']}; }}
+        .qx-badge-warn {{ background: rgba(217,119,6,0.12); color: {t['medium']}; }}
+        .qx-badge-error {{ background: rgba(239,68,68,0.15); color: {t['high']}; }}
+
+        /* Sidebar branding & footer */
+        .qx-logo {{
+            font-size: 1.5rem; font-weight: 800; letter-spacing: -0.02em;
+            color: {t['sidebar_text']} !important;
+            display: flex; align-items: center; gap: 10px;
+        }}
+        .qx-logo-mark {{
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 38px; height: 38px; border-radius: 50%;
+            background: {t['accent']};
+            color: #ffffff; font-weight: 800; font-size: 0.9rem;
+            box-shadow: 0 2px 8px {t.get('accent_glow', 'rgba(13,148,136,0.15)')};
+            overflow: visible;
+        }}
+        .qx-logo-sub {{ font-size: 0.62rem; letter-spacing: 0.18em; color: {t['nav_inactive']} !important; margin-top: 4px; }}
+        .qx-usage {{
+            font-size: 0.75rem; color: {t['text_secondary']} !important; line-height: 1.7;
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-sm); padding: 12px 14px;
+        }}
+        .qx-usage strong {{ color: {t['text_primary']} !important; }}
+        .qx-tier {{
+            background: linear-gradient(135deg, var(--accent-soft) 0%, transparent 100%);
+            border: 1px solid {t['accent_soft']};
+            border-radius: var(--radius-md); padding: 12px 16px; margin-top: 12px;
+        }}
+        .qx-nav-label {{
+            font-size: 0.63rem; font-weight: 700; letter-spacing: 0.12em;
+            text-transform: uppercase; color: {t['accent']} !important;
+            padding: 12px 14px 4px 14px; margin-top: 0; margin-bottom: 0;
+        }}
+
+        /* Wizard steps */
+        .qx-wizard-track {{
+            display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+            margin-bottom: 1.5rem; padding: 16px 20px;
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-md); box-shadow: var(--shadow-card);
+        }}
+        .qx-step {{
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 8px 16px; border-radius: 999px; font-size: 0.82rem;
+            border: 1px solid transparent; font-weight: 500;
+        }}
+        .qx-step-active {{
+            background: var(--accent-soft); color: {t['accent']}; font-weight: 700;
+            border-color: {t['accent']}; box-shadow: 0 0 12px {t['accent_glow']};
+        }}
+        .qx-step-done {{ background: rgba(34,197,94,0.1); color: {t['success']}; border-color: rgba(34,197,94,0.25); }}
+        .qx-step-pending {{ color: {t['text_secondary']}; border-color: var(--border); background: var(--border-subtle); }}
+
+        /* Misc */
+        .qx-filter-pill {{
+            display: inline-block; padding: 4px 14px; margin: 2px 4px 2px 0;
+            border-radius: 999px; border: 1px solid var(--border);
+            font-size: 0.8rem; cursor: pointer;
+        }}
+        .qx-filter-pill.active {{ border-color: {t['accent']}; color: {t['accent']}; background: {t['accent_soft']}; }}
+
+        /* Subject cards (Run Analysis wizard) */
+        .qx-subject-card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 16px 18px;
+            margin-bottom: 10px;
+            box-shadow: var(--shadow-card);
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }}
+        .qx-subject-card.selected {{
+            border-color: {t['accent']};
+            box-shadow: 0 0 0 1px {t['accent']}, var(--shadow-glow);
+            background: linear-gradient(135deg, var(--accent-soft) 0%, var(--card-bg) 60%);
+        }}
+
+        /* Dashboard */
+        .qx-dash-header {{
+            display: flex; justify-content: space-between; align-items: flex-end;
+            margin-bottom: 1.5rem; padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }}
+        .qx-dash-title {{ font-size: 1.75rem; font-weight: 700; color: var(--text-primary); margin: 0; }}
+        .qx-dash-sub {{ font-size: 0.9rem; color: var(--text-secondary); margin-top: 4px; }}
+        .qx-dash-meta {{ text-align: right; font-size: 0.8rem; color: var(--text-secondary); }}
+        .qx-kpi-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 1.5rem; }}
+        .qx-kpi-grid-auto {{ grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }}
+        @media (max-width: 900px) {{ .qx-kpi-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
+        .qx-kpi-card {{
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-md); padding: 20px 22px;
+            box-shadow: var(--shadow-card); position: relative; overflow: hidden;
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }}
+        .qx-kpi-card::before {{
+            content: ''; position: absolute; top: 0; left: 0; width: 3px; height: 100%;
+            background: var(--kpi-accent, var(--accent)); opacity: 0.85;
+        }}
+        .qx-kpi-card:hover {{ transform: translateY(-2px); border-color: {"#cbd5e1" if is_light else "#353849"}; }}
+        .qx-kpi-label {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-secondary); font-weight: 600; }}
+        .qx-kpi-value {{ font-size: 2rem; font-weight: 800; letter-spacing: -0.03em; color: var(--text-primary); margin: 8px 0 4px; line-height: 1; }}
+        .qx-kpi-delta {{ font-size: 0.78rem; font-weight: 500; }}
+        .qx-kpi-delta.up {{ color: {t['success']}; }}
+        .qx-kpi-delta.down {{ color: {t['high']}; }}
+        .qx-kpi-delta.neutral {{ color: var(--text-secondary); }}
+        .qx-panel-title {{
+            font-size: 0.95rem; font-weight: 600; color: var(--text-primary);
+            margin: 0 0 12px 0; padding-bottom: 8px; border-bottom: 1px solid var(--border);
+        }}
+        .qx-finding-row {{
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 0.875rem;
+        }}
+        .qx-finding-row:last-child {{ border-bottom: none; }}
+        .qx-score-ring {{
+            text-align: center; padding: 8px 0;
+        }}
+        .qx-score-ring-value {{
+            font-size: 2.4rem; font-weight: 700; color: {t['accent']}; line-height: 1;
+        }}
+        .qx-score-ring-label {{
+            font-size: 0.75rem; color: var(--text-secondary); margin-top: 6px;
+            text-transform: uppercase; letter-spacing: 0.05em;
+        }}
+        .qx-audit-item {{
+            border-left: 2px solid {t['accent']};
+            padding: 8px 0 8px 14px; margin-bottom: 12px;
+        }}
+        .qx-mismatch {{ background: rgba(239,68,68,0.08); padding: 2px 6px; border-radius: 4px; color: {t['high']} !important; }}
+        .qx-match {{ color: {t['success']} !important; }}
+        .qx-warn {{ color: {t['medium']} !important; }}
+        .qx-error {{ color: {t['high']} !important; }}
+        .stPlotlyChart {{ background: var(--card-bg); border-radius: 8px; padding: 8px; }}
+
+        /* Inputs & widgets in main area */
+        .main .stTextInput label,
+        .main .stTextInput input,
+        .main .stButton > button,
+        .main [data-testid="stButton"] > button {{
+            color: var(--text-primary) !important;
+        }}
+        .main .stButton > button[kind="secondary"],
+        .main [data-testid="stButton"] > button[kind="secondary"] {{
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            color: var(--text-primary) !important;
+        }}
+        .main .stButton > button[kind="primary"],
+        .main [data-testid="stButton"] > button[kind="primary"] {{
+            background: {t['accent']} !important;
+            color: #ffffff !important;
+            border: none !important;
+            font-weight: 600 !important;
+            box-shadow: 0 2px 12px {t['accent_glow']} !important;
+        }}
+        .main .stButton > button[kind="primary"]:hover,
+        .main [data-testid="stButton"] > button[kind="primary"]:hover {{
+            filter: brightness(1.08);
+        }}
+
+        /* Filter pill buttons (Anomalies) — après les styles généraux */
+        .main div[data-testid="column"] .stButton > button,
+        .main div[data-testid="column"] [data-testid="stButton"] > button {{
+            border-radius: 999px !important;
+            font-size: 0.8rem !important;
+            padding: 6px 14px !important;
+            min-height: 2rem !important;
+        }}
+        .main div[data-testid="column"] .stButton > button[kind="primary"],
+        .main div[data-testid="column"] [data-testid="stButton"] > button[kind="primary"] {{
+            background: {t['accent_soft']} !important;
+            color: {t['accent']} !important;
+            border: 1px solid {t['accent']} !important;
+            font-weight: 600 !important;
+            box-shadow: none !important;
+        }}
+        .main div[data-testid="column"] .stButton > button[kind="primary"]:hover,
+        .main div[data-testid="column"] [data-testid="stButton"] > button[kind="primary"]:hover {{
+            background: {t['accent_glow']} !important;
+            color: {t['accent']} !important;
+        }}
+        .main div[data-testid="column"] .stButton > button[kind="secondary"],
+        .main div[data-testid="column"] [data-testid="stButton"] > button[kind="secondary"] {{
+            background: {"#ffffff" if is_light else "transparent"} !important;
+            border: 1px solid var(--border) !important;
+            color: var(--text-secondary) !important;
+        }}
+        .main div[data-testid="column"] .stButton > button[kind="secondary"]:hover,
+        .main div[data-testid="column"] [data-testid="stButton"] > button[kind="secondary"]:hover {{
+            border-color: {t['accent']} !important;
+            color: {t['accent']} !important;
+            background: {"#f8fafc" if is_light else "transparent"} !important;
+        }}
+
+        /* Login page */
+        .qx-login-wrap {{ max-width: 440px; margin: 0 auto; }}
+        .qx-login-card {{
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-lg); padding: 2rem 2.25rem;
+            box-shadow: var(--shadow-card), var(--shadow-glow);
+            position: relative; overflow: hidden;
+        }}
+        .qx-login-card::before {{
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+            background: linear-gradient(90deg, var(--accent), #14b8a6, var(--accent));
+        }}
+        .qx-login-hero {{ text-align: center; padding: 2.5rem 0 1.5rem 0; }}
+        .qx-login-features {{ display: grid; gap: 10px; margin-top: 1.5rem; text-align: left; font-size: 0.82rem; }}
+        .qx-login-feature {{
+            display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+            background: var(--border-subtle); border-radius: var(--radius-sm); border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }}
+        .qx-login-feature-icon {{ color: var(--accent); font-weight: 700; }}
+
+        /* Data editor premium */
+        [data-testid="stDataEditor"] {{ border: none !important; }}
+        [data-testid="stDataFrame"] {{ border: none; border-radius: var(--radius-sm); }}
+
+        /* Tabs premium */
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {{
+            gap: 4px; border-bottom: 1px solid var(--border) !important;
+        }}
+        [data-testid="stTabs"] [data-baseweb="tab-list"] button {{
+            font-weight: 600 !important; font-size: 0.85rem !important;
+            padding: 10px 18px !important; border-radius: 8px 8px 0 0 !important;
+        }}
+        [data-testid="stTabs"] [data-baseweb="tab-list"] button[aria-selected="true"] {{
+            background: var(--accent-soft) !important;
+        }}
+
+        /* Rule toggle cards */
+        .qx-rule-card {{
+            background: var(--card-bg);
+            border: 1.5px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 14px 16px;
+            margin-bottom: 10px;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }}
+        .qx-rule-card.active {{
+            border-color: var(--accent);
+            background: linear-gradient(135deg, {t['accent_soft']} 0%, var(--card-bg) 100%);
+            box-shadow: 0 0 0 1px {t['accent_glow']}, 0 2px 8px {t['accent_soft']};
+        }}
+        .qx-rule-card.active::before {{
+            content: ''; position: absolute; top: 0; left: 0; width: 3px; height: 100%;
+            background: var(--accent);
+        }}
+        .qx-rule-card:hover {{
+            border-color: {t['accent']};
+            transform: translateY(-1px);
+        }}
+        .qx-rule-card-id {{
+            font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
+            text-transform: uppercase; color: var(--accent);
+            margin-bottom: 4px;
+        }}
+        .qx-rule-card-name {{
+            font-size: 0.88rem; font-weight: 600; color: var(--text-primary);
+            line-height: 1.3;
+        }}
+        .qx-rule-card-check {{
+            font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;
+            line-height: 1.4;
+        }}
+        .qx-rule-card-badge {{
+            position: absolute; top: 10px; right: 12px;
+            width: 20px; height: 20px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 0.65rem; font-weight: 700;
+        }}
+        .qx-rule-card-badge.on {{
+            background: var(--accent); color: #1a1d23;
+        }}
+        .qx-rule-card-badge.off {{
+            background: var(--border); color: var(--text-secondary);
+        }}
+
+        /* Form groups */
+        .qx-form-group {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 20px 24px;
+            margin-bottom: 16px;
+        }}
+        .qx-form-group-title {{
+            font-size: 0.78rem; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.08em; color: var(--text-secondary);
+            margin-bottom: 14px; padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+        }}
+
+        /* Dedup panel */
+        .qx-dedup-panel {{
+            background: linear-gradient(135deg, rgba(59,130,246,0.04) 0%, var(--card-bg) 100%);
+            border: 1px solid rgba(59,130,246,0.2);
+            border-radius: var(--radius-md);
+            padding: 20px 24px;
+            margin-bottom: 16px;
+        }}
+        .qx-dedup-panel-title {{
+            font-size: 0.88rem; font-weight: 700; color: var(--text-primary);
+            margin-bottom: 4px;
+        }}
+        .qx-dedup-panel-sub {{
+            font-size: 0.78rem; color: var(--text-secondary); margin-bottom: 14px;
+        }}
+
+        /* Score ring premium */
+        .qx-score-big {{
+            text-align: center; padding: 20px;
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: var(--radius-lg); position: relative;
+        }}
+        .qx-score-big-value {{
+            font-size: 3.5rem; font-weight: 800; letter-spacing: -0.04em;
+            color: var(--accent); line-height: 1;
+        }}
+        .qx-score-big-label {{
+            font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em;
+            color: var(--text-secondary); margin-top: 8px; font-weight: 600;
+        }}
+
+        /* Status indicator dots */
+        .qx-status-dot {{
+            display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+            margin-right: 6px;
+        }}
+        .qx-status-dot.green {{ background: {t['success']}; box-shadow: 0 0 6px rgba(34,197,94,0.4); }}
+        .qx-status-dot.orange {{ background: {t['medium']}; box-shadow: 0 0 6px rgba(217,119,6,0.4); }}
+        .qx-status-dot.red {{ background: {t['high']}; box-shadow: 0 0 6px rgba(239,68,68,0.4); }}
+
+        /* Metric card enhanced */
+        div[data-testid="metric-container"] {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 18px 20px;
+            box-shadow: var(--shadow-card);
+            transition: transform 0.2s ease, border-color 0.2s ease;
+        }}
+        div[data-testid="metric-container"]:hover {{
+            transform: translateY(-2px);
+            border-color: {t['accent_glow']};
+        }}
+
+        /* Selectbox & multiselect refinement */
+        [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+        [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
+            border-radius: 8px !important;
+            min-height: 42px !important;
+        }}
+
+        /* Form submit buttons */
+        [data-testid="stForm"] [data-testid="stFormSubmitButton"] button {{
+            background: var(--accent) !important;
+            color: #ffffff !important;
+            border: none !important;
+            font-weight: 600 !important;
+            border-radius: 8px !important;
+            box-shadow: 0 2px 12px {t['accent_glow']} !important;
+            padding: 10px 24px !important;
+        }}
+        [data-testid="stForm"] [data-testid="stFormSubmitButton"] button:hover {{
+            filter: brightness(1.1) !important;
+            transform: translateY(-1px);
+        }}
+
+        /* Checkbox premium */
+        [data-testid="stCheckbox"] {{
+            padding: 4px 0 !important;
+        }}
+        [data-testid="stCheckbox"] label {{
+            gap: 10px !important;
+        }}
+
+        /* Streamlit container with border — card styling */
+        [data-testid="stVerticalBlockBorderWrapper"] {{
+            border-radius: 16px !important;
+            border-color: var(--border) !important;
+            background: var(--card-bg) !important;
+        }}
+        [data-testid="stVerticalBlockBorderWrapper"] > div {{
+            padding: 20px 24px !important;
+        }}
+
+        ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+        ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 999px; }}
+        #MainMenu {{ visibility: hidden; }}
+        footer {{ visibility: hidden; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def severity_badge(severity: str) -> str:
+    cls = {"HIGH": "qx-badge-high", "MEDIUM": "qx-badge-medium", "LOW": "qx-badge-low"}.get(severity, "")
+    label = TR_SEVERITY.get(severity, severity)
+    return f'<span class="qx-badge {cls}">{html.escape(label)}</span>'
+
+
+def status_badge(status: str) -> str:
+    cls = {
+        "Open": "qx-badge-open",
+        "In Review": "qx-badge-review",
+        "Resolved": "qx-badge-resolved",
+        "Dismissed": "qx-badge-dismissed",
+    }.get(status, "qx-badge-dismissed")
+    label = TR_STATUS.get(status, status)
+    return f'<span class="qx-badge {cls}">{html.escape(label)}</span>'
+
+
+def subject_label(subject: str) -> str:
+    return TR_SUBJECT.get(subject, subject)
+
+
+def priority_badge(priority: str) -> str:
+    cls = {"P1": "qx-badge-p1", "P2": "qx-badge-p2", "P3": "qx-badge-p3"}.get(priority, "")
+    return f'<span class="qx-badge {cls}">{html.escape(priority)}</span>'
+
+
+def card(html_content: str) -> None:
+    st.markdown(f'<div class="qx-card">{html_content}</div>', unsafe_allow_html=True)
+
+
+def kpi_card(label: str, value: str, delta: str, direction: str = "neutral", accent: str = "", highlight: bool = False) -> str:
+    t = get_theme()
+    if highlight:
+        bg = t['accent']
+        text_color = "#ffffff"
+        delta_color = "rgba(255,255,255,0.8)"
+        arrow_bg = "rgba(255,255,255,0.2)"
+    else:
+        bg = t['card_bg']
+        text_color = t['text_primary']
+        delta_color = t['success'] if direction == "up" else (t['high'] if direction == "down" else t['text_secondary'])
+        arrow_bg = t['accent_soft']
+    arrow_icon = "↗" if direction == "up" else ("↘" if direction == "down" else "→")
+    return (
+        f'<div style="background:{bg};border:1px solid {t["border"]};border-radius:16px;'
+        f'padding:20px 22px;position:relative;min-width:0;">'
+        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;">'
+        f'<div style="font-size:0.78rem;font-weight:600;color:{delta_color if highlight else t["text_secondary"]};">{html.escape(label)}</div>'
+        f'<span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;'
+        f'border-radius:8px;background:{arrow_bg};font-size:0.8rem;">{arrow_icon}</span>'
+        f'</div>'
+        f'<div style="font-size:2.2rem;font-weight:800;color:{text_color};margin:10px 0 6px;line-height:1;">{html.escape(value)}</div>'
+        f'<div style="font-size:0.78rem;color:{delta_color};">'
+        f'{"▲" if direction == "up" else ("▼" if direction == "down" else "●")} {html.escape(delta)}</div>'
+        f'</div>'
+    )
+
+
+def kpi_grid(*cards: str, auto: bool = False) -> None:
+    cls = "qx-kpi-grid qx-kpi-grid-auto" if auto else "qx-kpi-grid"
+    st.markdown(f'<div class="{cls}">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def page_header(title: str, subtitle: str = "", badges: list[str] | None = None):
+    """Premium page title block."""
+    t = get_theme()
+    badge_html = ""
+    for b in badges or []:
+        badge_html += f'<span class="qx-page-badge">{html.escape(b)}</span> '
+    sub_part = f'<p class="qx-page-sub">{html.escape(subtitle)}</p>' if subtitle else ""
+    badge_part = f'<div class="qx-page-badges">{badge_html}</div>' if badge_html else ""
+    st.markdown(
+        f'<div class="qx-page-header">'
+        f'<div class="qx-page-header-glow"></div>'
+        f'<div class="qx-page-header-inner">'
+        f'<h1 class="qx-page-title">{html.escape(title)}</h1>'
+        f'{sub_part}'
+        f'{badge_part}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def section_header(title: str, subtitle: str = "", icon: str = ""):
+    """Section divider with icon."""
+    icon_html = f'<span class="qx-section-icon">{html.escape(icon)}</span>' if icon else ""
+    sub_html = f'<div class="qx-section-sub">{html.escape(subtitle)}</div>' if subtitle else ""
+    st.markdown(
+        f'<div class="qx-section-head">'
+        f'{icon_html}'
+        f'<div><div class="qx-section-title">{html.escape(title)}</div>'
+        f'{sub_html}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def plotly_layout(fig, t, height=None):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=t["text_primary"], family="Inter, sans-serif"),
+        margin=dict(l=10, r=10, t=36, b=10),
+        legend=dict(font=dict(color=t["text_secondary"], size=11)),
+    )
+    fig.update_xaxes(gridcolor=t["border"], zerolinecolor=t["border"], showgrid=True, gridwidth=1)
+    fig.update_yaxes(gridcolor=t["border"], zerolinecolor=t["border"], showgrid=False)
+    if height:
+        fig.update_layout(height=height)
+    return fig
+
+
+def init_session_data():
+    if "findings" not in st.session_state:
+        st.session_state["findings"] = []
+    else:
+        # Ensure findings have source_table (schema may have been updated)
+        _f = st.session_state["findings"]
+        if _f and len(_f) > 0 and "source_table" not in _f[0]:
+            st.session_state["findings"] = load_dq_findings()
+    if "audit_log" not in st.session_state:
+        st.session_state["audit_log"] = []
+    if "fr_anomalies" not in st.session_state:
+        st.session_state["fr_anomalies"] = []
+    if "fr_corrections" not in st.session_state:
+        st.session_state["fr_corrections"] = []
+    if "fr_scan_done" not in st.session_state:
+        st.session_state["fr_scan_done"] = False
+    if "fr_upload_anomalies" not in st.session_state:
+        st.session_state["fr_upload_anomalies"] = []
+    if "wizard_stats" not in st.session_state:
+        st.session_state["wizard_stats"] = {}
+    if "usage_lines" not in st.session_state:
+        st.session_state["usage_lines"] = 0
+    if "usage_rules" not in st.session_state:
+        st.session_state["usage_rules"] = 0
+    if "fr_removed_df" not in st.session_state:
+        st.session_state["fr_removed_df"] = pd.DataFrame()
+    if "usage_refs" not in st.session_state:
+        st.session_state["usage_refs"] = 0
+    if "fr_clean_df" not in st.session_state:
+        st.session_state["fr_clean_df"] = pd.DataFrame()
+
+
+def get_fr_anomalies():
+    return st.session_state.get("fr_anomalies", [])
+
+
+def get_fr_corrections():
+    # First check session state
+    _session_corr = st.session_state.get("fr_corrections", [])
+    if _session_corr:
+        return _session_corr
+    # Fallback: load from database
+    try:
+        df = _sf_query("SELECT * FROM QUALITY_TEST.DATA_QUALITY.DQ_CORRECTIONS WHERE action = 'Accepted' ORDER BY created_at DESC")
+        if not df.empty:
+            df.columns = [c.lower() for c in df.columns]
+            return df.to_dict("records")
+    except Exception:
+        pass
+    return []
+
+
+def fr_resolve_anomaly(anomaly_id: str, action: str, rejection_reason: str = "", corrected_value: str = ""):
+    anomaly = None
+    for store_key in ("fr_anomalies", "fr_upload_anomalies"):
+        for a in st.session_state.get(store_key, []):
+            if a["id"] == anomaly_id:
+                anomaly = a
+                break
+        if anomaly:
+            break
+    # Also check DQ_FINDINGS from database
+    if not anomaly:
+        db_findings = load_dq_findings()
+        for f in db_findings:
+            if f.get("id") == anomaly_id:
+                anomaly = {
+                    "id": f["id"],
+                    "account_id": str(f.get("account_id", "")),
+                    "company_name": str(f.get("company_name", "")),
+                    "rule_id": str(f.get("rule_id", "")),
+                    "field": str(f.get("field", "")),
+                    "field_label": str(f.get("field_label", "")),
+                    "field_value": str(f.get("field_value", "")),
+                    "expected_value": str(f.get("expected_value", "")),
+                    "severity": str(f.get("severity", "MEDIUM")),
+                    "status": str(f.get("status", "Open")),
+                }
+                break
+    if not anomaly:
+        return
+    new_status = "Resolved" if action == "Accepted" else "Dismissed"
+    correction = {
+        "id": f"COR-{len(st.session_state['fr_corrections']) + 1:03d}",
+        "anomaly_id": anomaly_id,
+        "account_id": anomaly["account_id"],
+        "company_name": anomaly["company_name"],
+        "field": anomaly["field"],
+        "field_value": anomaly["field_value"],
+        "expected_value": anomaly["expected_value"],
+        "rule_id": anomaly["rule_id"],
+        "action": action,
+        "rejection_reason": rejection_reason if action == "Rejected" else "",
+        "timestamp": _now().strftime("%Y-%m-%d %H:%M"),
+        "status": "Accepted" if action == "Accepted" else "Rejected",
+    }
+    st.session_state["fr_corrections"].insert(0, correction)
+    write_dq_correction_db(correction)
+    anomaly["status"] = new_status
+    # Update status in DQ_FINDINGS table
+    update_finding_status_db(anomaly_id, new_status)
+    # If accepted with a corrected value, update the source table (DIM_ACCOUNT)
+    if action == "Accepted" and corrected_value and anomaly.get("account_id") and anomaly.get("field"):
+        field_col = anomaly["field"]
+        account_id = anomaly["account_id"]
+        try:
+            _sf_execute(
+                f"UPDATE QUALITY_TEST.COMMERCIAL_DATA.DIM_ACCOUNT "
+                f"SET {field_col} = %(val)s WHERE account_id = %(acct)s",
+                {"val": corrected_value, "acct": account_id},
+            )
+            load_dim_account.clear()
+        except Exception:
+            pass  # Column may not exist in DIM_ACCOUNT — skip silently
+    add_audit_entry(
+        "Correction FR acceptée" if action == "Accepted" else "Correction FR rejetée",
+        f'{anomaly_id} · {anomaly["field"]} · {anomaly["company_name"]}'
+        + (f' → {corrected_value}' if corrected_value else ''),
+    )
+
+
+def get_findings():
+    """Get findings, ensuring source_table column is present (reload if stale cache)."""
+    _f = st.session_state.get("findings")
+    if _f and len(_f) > 0 and "source_table" not in _f[0]:
+        # Stale cache without source_table — force reload
+        load_dq_findings.clear()
+        _fqn = _dim_account_fqn()
+        _f = load_dq_findings(_fqn if _fqn != "..DIM_ACCOUNT" else "")
+        st.session_state["findings"] = _f
+        return _f
+    if _f is not None:
+        return _f
+    _fqn = _dim_account_fqn()
+    return load_dq_findings(_fqn if _fqn != "..DIM_ACCOUNT" else "")
+
+
+def get_audit_log():
+    return st.session_state.get("audit_log", load_dq_audit_log())
+
+
+def update_finding_status(finding_id: str, new_status: str):
+    # Update in session findings list
+    for f in st.session_state.get("findings", []):
+        if f["id"] == finding_id:
+            f["status"] = new_status
+            break
+    # Also update in fr_upload_anomalies if present
+    for f in st.session_state.get("fr_upload_anomalies", []):
+        if f.get("id") == finding_id:
+            f["status"] = new_status
+            break
+    update_finding_status_db(finding_id, new_status)
+
+
+def add_audit_entry(action: str, detail: str):
+    entry = {
+        "time": _now().strftime("%Y-%m-%d %H:%M"),
+        "user": st.session_state.get("sf_user", "unknown"),
+        "action": action,
+        "detail": detail,
+    }
+    st.session_state["audit_log"].insert(0, entry)
+    write_audit_log_db(action, detail)
+
+
+def render_filter_pills(
+    label: str,
+    options: list[tuple[str, str]],
+    state_key: str,
+    key_prefix: str,
+    reset_page_key: str | None = None,
+):
+    st.markdown(f"**{label}**")
+    cols = st.columns(len(options))
+    current = st.session_state.get(state_key, "All")
+    for i, (display, value) in enumerate(options):
+        with cols[i]:
+            if st.button(
+                display,
+                key=f"{key_prefix}_{value}",
+                use_container_width=True,
+                type="primary" if current == value else "secondary",
+            ):
+                st.session_state[state_key] = value
+                if reset_page_key:
+                    st.session_state[reset_page_key] = 0
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Import fichier · détection colonnes · croisement INSEE
+# ---------------------------------------------------------------------------
+
+
+def _norm_col(name: str) -> str:
+    n = re.sub(r"[^a-z0-9]", "_", str(name).lower().strip())
+    return re.sub(r"_+", "_", n).strip("_")
+
+
+def _cell_str(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).strip()
+    if s.upper() in ("NAN", "NONE", "NULL", "NA", "N/A", "#N/A", "NAT"):
+        return ""
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _safe_display(val, fallback: str = "—") -> str:
+    """Convert any value to a clean display string. NaN/None/null → fallback."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return fallback
+    s = str(val).strip()
+    if s.upper() in ("NAN", "NONE", "NULL", "NA", "N/A", "#N/A", "NAT", ""):
+        return fallback
+    return s
+
+
+def _digits_only(val: str) -> str:
+    return re.sub(r"\D", "", _cell_str(val))
+
+
+def detect_column_mapping(columns: list[str]) -> dict[str, str | None]:
+    normalized = {_norm_col(c): c for c in columns}
+    mapping = {}
+    used_columns = set()
+    # Pass 1: exact alias match (highest confidence)
+    for field, aliases in COLUMN_ALIASES.items():
+        mapping[field] = None
+        for alias in aliases:
+            key = _norm_col(alias)
+            if key in normalized and normalized[key] not in used_columns:
+                mapping[field] = normalized[key]
+                used_columns.add(normalized[key])
+                break
+    # Pass 2: for unmatched fields, check if any column CONTAINS an alias
+    for field, aliases in COLUMN_ALIASES.items():
+        if mapping[field] is not None:
+            continue
+        best_match = None
+        best_len = 999
+        for col_norm, col_orig in normalized.items():
+            if col_orig in used_columns:
+                continue
+            for alias in aliases:
+                alias_norm = _norm_col(alias)
+                if alias_norm in col_norm and len(col_norm) < best_len:
+                    best_match = col_orig
+                    best_len = len(col_norm)
+        if best_match:
+            mapping[field] = best_match
+            used_columns.add(best_match)
+    return mapping
+
+
+def detect_column_mapping_ai(columns: tuple) -> dict[str, str | None]:
+    """Use Cortex AI to intelligently map CSV column headers to expected fields."""
+    target_fields = {
+        "siren": "SIREN — 9-digit French company registration number",
+        "siret": "SIRET — 14-digit French establishment number (SIREN + NIC)",
+        "company_name": "Company name / Raison sociale",
+        "vat": "VAT number / N° TVA intracommunautaire (starts with FR)",
+        "address": "Street address / Adresse postale",
+        "city": "City / Ville / Commune",
+        "naf": "NAF/APE code — French industry classification (format: 4 digits + 1 letter)",
+        "country": "Country code or name",
+        "account_id": "Unique account/customer identifier",
+        "legal_form": "Legal form / Forme juridique (SA, SAS, SARL, EURL…)",
+    }
+    cols_str = json.dumps(list(columns), ensure_ascii=False)
+    fields_str = json.dumps(target_fields, ensure_ascii=False)
+    prompt = (
+        f"You are a data mapping assistant. Match these CSV/Excel column headers to the target fields.\n\n"
+        f"CSV columns: {cols_str}\n\n"
+        f"Target fields (key: description): {fields_str}\n\n"
+        f"IMPORTANT RULES:\n"
+        f"- When multiple columns could match a field, prefer the SHORTEST and SIMPLEST column name.\n"
+        f"  Example: prefer 'Siret' over 'Billing Account: Siret Number'.\n"
+        f"- Column matching is case-insensitive. 'VAT' matches 'vat'.\n"
+        f"- A column named exactly like the field (e.g. 'Siret' for siret) is always the best match.\n"
+        f"- Do NOT map a field if there is no reasonable match — use null.\n"
+        f"- Each column can only be mapped to ONE field.\n\n"
+        f"Return ONLY a valid JSON object where keys are target field names and values are "
+        f"the best matching CSV column name (exact string from the CSV columns list), or null if no match.\n"
+        f"Do not add explanations. Only output the JSON object."
+    )
+    try:
+        df = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${prompt}$$) AS result")
+        if df.empty:
+            return {k: None for k in target_fields}
+        raw = str(df.iloc[0]['result']).strip()
+        # Extract JSON from potential markdown code block
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        mapping = json.loads(raw)
+        # Normalize keys to lowercase and validate mapped values exist in columns
+        col_set = set(columns)
+        # Build case-insensitive lookup for column matching
+        col_lower_map = {c.strip().lower(): c for c in columns}
+        result = {}
+        for k, v in mapping.items():
+            key = k.strip().lower()
+            if key not in target_fields:
+                continue
+            if v is None:
+                result[key] = None
+            elif v in col_set:
+                result[key] = v
+            elif isinstance(v, str) and v.strip().lower() in col_lower_map:
+                result[key] = col_lower_map[v.strip().lower()]
+            else:
+                result[key] = None
+        # Fill missing fields with None
+        for k in target_fields:
+            if k not in result:
+                result[k] = None
+        return result
+    except Exception:
+        return {k: None for k in target_fields}
+
+
+def _clean_trailing_junk(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove trailing rows that are empty or contain footer text (not real data)."""
+    if df.empty:
+        return df
+    # Drop rows where ALL columns are NaN/empty
+    df = df.dropna(how="all").reset_index(drop=True)
+    # Drop rows where the first non-null cell looks like a footer
+    footer_patterns = re.compile(
+        r"^(confidential|copyright|©|all rights reserved|generated by|report generated|"
+        r"do not distribute|proprietary|disclaimer|page \d|total[:\s])",
+        re.IGNORECASE,
+    )
+    rows_to_drop = []
+    # Check from the end — stop at first real data row
+    for i in range(len(df) - 1, -1, -1):
+        row_vals = [str(v).strip() for v in df.iloc[i] if pd.notna(v) and str(v).strip()]
+        if not row_vals:
+            rows_to_drop.append(i)
+            continue
+        first_val = row_vals[0]
+        if footer_patterns.search(first_val):
+            rows_to_drop.append(i)
+            continue
+        # Row has real data — stop trimming
+        break
+    if rows_to_drop:
+        df = df.drop(index=rows_to_drop).reset_index(drop=True)
+    return df
+
+
+def load_uploaded_file(uploaded) -> pd.DataFrame:
+    name = uploaded.name.lower()
+    raw = uploaded.getvalue()
+
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        try:
+            df = pd.read_excel(io.BytesIO(raw), dtype=str)
+            first_col = str(df.columns[0]).strip()
+            if first_col.replace(" ", "").isdigit() or len(df.columns[0]) > 80:
+                df = pd.read_excel(io.BytesIO(raw), dtype=str, header=1)
+            return _clean_trailing_junk(df)
+        except Exception as exc:
+            raise ValueError(
+                f"Impossible de lire le fichier Excel ({exc}). "
+                "Formats supportés : .xlsx · pour .xls ancien, exportez en CSV."
+            ) from exc
+
+    last_err = None
+    for encoding in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        for sep in (";", ",", "\t", "|"):
+            try:
+                df = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=encoding, dtype=str, on_bad_lines="skip")
+                if df.shape[1] >= 2:
+                    return _clean_trailing_junk(df)
+            except Exception as exc:
+                last_err = exc
+    raise ValueError(f"Impossible de lire le fichier CSV ({last_err})")
+
+
+def _valid_siren(siren: str) -> bool:
+    return bool(re.fullmatch(r"\d{9}", siren))
+
+
+def _valid_siret(siret: str) -> bool:
+    return bool(re.fullmatch(r"\d{14}", siret))
+
+
+def _valid_vat_fr(vat: str) -> bool:
+    v = _cell_str(vat).upper().replace(" ", "")
+    return bool(re.fullmatch(r"FR[A-HJ-NP-Z0-9]{2}\d{9}", v)) or bool(re.fullmatch(r"FR\d{11}", v))
+
+
+def _valid_naf(naf: str) -> bool:
+    n = naf.strip().replace(".", "").replace(" ", "")
+    return bool(re.fullmatch(r"\d{4}[A-Za-z]", n))
+
+
+_LEGAL_FORM_PATTERN = re.compile(
+    r"\b(SAS|SARL|SA|SE|SCA|SNC|EURL|SCI|GIE|SCM|SASU|EARL|GAEC|SEM|EP)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_legal_form(company_name: str) -> str:
+    m = _LEGAL_FORM_PATTERN.search(company_name)
+    return m.group(0).upper() if m else ""
+
+
+def _siret_matches_siren(siren: str, siret: str) -> bool:
+    return len(siren) == 9 and len(siret) == 14 and siret.startswith(siren)
+
+
+def _vat_from_siren(siren: str) -> str:
+    if not _valid_siren(siren):
+        return ""
+    # Public entities (communes, départements, établissements publics) use alphanumeric
+    # TVA keys that cannot be computed from the SIREN alone.
+    # SIREN starting with 1 or 2 = collectivités territoriales / organismes publics
+    if siren[0] in ("1", "2"):
+        return ""
+    key = (12 + 3 * (int(siren) % 97)) % 97
+    return f"FR{key:02d}{siren}"
+
+
+def _is_french_city(city: str) -> bool:
+    """Heuristic: detect if a city looks French (no DB query needed)."""
+    if not city or len(city.strip()) < 2:
+        return False
+    city_upper = city.upper().strip()
+    # Contains CEDEX → definitely French
+    if "CEDEX" in city_upper:
+        return True
+    # Ends with FR
+    if city_upper.endswith(" FR"):
+        return True
+    # Contains a French postal code pattern (5 digits)
+    import re
+    if re.search(r'\b\d{5}\b', city_upper):
+        return True
+    return False
+
+
+_CORTEX_SEARCH_SERVICE = "QUALITY_TEST.DATA_QUALITY.SIRENE_COMPANY_SEARCH"
+_CORTEX_SEARCH_COLUMNS = '["SIREN","DENOMINATION","VILLE","CODE_POSTAL","NAF","SIRET","CATEGORIE_JURIDIQUE","ADRESSE","STATUT"]'
+
+
+@st.cache_data(ttl=300)
+def _cortex_search_sirene(query_text: str, limit: int = 3, filter_obj: dict | None = None) -> list[dict]:
+    """Search SIRENE via Cortex Search Service (semantic embeddings, ~13M sièges).
+
+    Returns a list of dicts with keys: siren, raison_sociale, ville, code_postal,
+    naf, siret, categorie_juridique, adresse, statut, _score.
+    """
+    if not query_text or len(query_text.strip()) < 2:
+        return []
+    # Build the JSON body — escape for SQL string literal
+    body = {"query": query_text.strip()[:120], "columns": json.loads(_CORTEX_SEARCH_COLUMNS), "limit": limit}
+    if filter_obj:
+        body["filter"] = filter_obj
+    body_json = json.dumps(body).replace("'", "''")
+    result_df = _sf_query(
+        f"SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW('{_CORTEX_SEARCH_SERVICE}', '{body_json}') AS r"
+    )
+    if result_df.empty:
+        return []
+    raw = json.loads(result_df.iloc[0]["r"])
+    rows = raw.get("results", [])
+    out = []
+    for r in rows:
+        scores = r.get("@scores", {})
+        best_score = max(scores.get("reranker_score", -99), scores.get("cosine_similarity", 0))
+        out.append({
+            "siren": r.get("SIREN", ""),
+            "raison_sociale": r.get("DENOMINATION", ""),
+            "ville": r.get("VILLE", ""),
+            "code_postal": r.get("CODE_POSTAL", ""),
+            "naf": r.get("NAF", ""),
+            "siret": r.get("SIRET", ""),
+            "categorie_juridique": r.get("CATEGORIE_JURIDIQUE", ""),
+            "adresse": r.get("ADRESSE", ""),
+            "statut": r.get("STATUT", ""),
+            "_score": best_score,
+            "_cosine": scores.get("cosine_similarity", 0),
+            "_reranker": scores.get("reranker_score", -99),
+        })
+    return out
+
+
+@st.cache_data(ttl=300)
+def _insee_search_by_name(company: str, city: str = "", postal_code: str = "") -> dict | None:
+    """Search SIRENE by company name using Cortex Search (semantic vector matching).
+
+    Falls back to classic EDITDISTANCE + SOUNDEX if Cortex Search is unavailable.
+    """
+    if not company or len(company.strip()) < 3:
+        return None
+    # Clean company name for search
+    name_clean = company.strip()
+    for suffix in ("SAS", "SARL", "SA", "SCI", "EURL", "EI", "SNC", "SASU"):
+        name_clean = re.sub(rf'\b{suffix}\b', '', name_clean, flags=re.IGNORECASE).strip()
+    name_clean = re.sub(r'\s+', ' ', name_clean).strip()
+    if len(name_clean) < 3:
+        return None
+
+    # Build search query: company name + city for better semantic matching
+    search_query = name_clean
+    if city and len(city.strip()) >= 2:
+        search_query = f"{name_clean} {city.strip()}"
+
+    # Optional filter on active companies
+    search_filter = {"@eq": {"STATUT": "A"}}
+
+    try:
+        results = _cortex_search_sirene(search_query, limit=5, filter_obj=search_filter)
+        if results:
+            best = results[0]
+            # Accept if cosine similarity is reasonable (>0.35)
+            if best.get("_cosine", 0) >= 0.35:
+                return best
+    except Exception:
+        pass
+
+    # --- Fallback: classic EDITDISTANCE + SOUNDEX (if Cortex Search unavailable) ---
+    name_sql = company.upper().replace("'", "''").strip()[:60]
+    for suffix in ("SAS", "SARL", "SA", "SCI", "EURL", "EI", "SNC", "SASU"):
+        name_sql = re.sub(rf'\b{suffix}\b', '', name_sql).strip()
+    name_sql = re.sub(r'\s+', ' ', name_sql).strip()
+    if len(name_sql) < 3:
+        return None
+    prefix3 = name_sql[:3].replace("'", "''")
+    score_expr = f"(1.0 - (EDITDISTANCE(UPPER(u.DENOMINATION), '{name_sql}') / GREATEST(LENGTH(u.DENOMINATION), LENGTH('{name_sql}'), 1))) * 60"
+    query = f"""
+        SELECT u.SIREN AS siren, u.DENOMINATION AS raison_sociale,
+               e.LIBELLE_COMMUNE AS ville, e.CODE_POSTAL AS code_postal,
+               u.SIREN || u.NIC_SIEGE AS siret, u.ACTIVITE_PRINCIPALE AS naf,
+               ({score_expr}) AS total_score
+        FROM {_SIRENE_UL} u
+        LEFT JOIN {_SIRENE_ETAB} e ON e.SIRET = u.SIREN || u.NIC_SIEGE
+        WHERE u.ETAT_ADMINISTRATIF = 'A' AND u.DENOMINATION IS NOT NULL AND LENGTH(u.DENOMINATION) > 2
+          AND (LEFT(UPPER(u.DENOMINATION), 3) = '{prefix3}' OR SOUNDEX(u.DENOMINATION) = SOUNDEX('{name_sql}'))
+        ORDER BY total_score DESC LIMIT 5
+    """
+    try:
+        df = _sf_query(query)
+        if not df.empty:
+            best = df.iloc[0]
+            if float(best.get("total_score", 0) or 0) >= 35:
+                return df.to_dict("records")[0]
+    except Exception:
+        pass
+    return None
+
+
+def _insee_crossref_row(siren: str, siret: str, company: str, address: str, naf: str) -> list[dict]:
+    """Croisement SIRENE réel (Marketplace 29M+) + écarts nom/adresse/NAF."""
+    issues = []
+    if not siren:
+        return issues
+    # Try cache first (pre-loaded for DIM_ACCOUNT), then individual lookup
+    ref = load_sirene_cache().get(siren) or lookup_sirene(siren)
+    if not ref:
+        issues.append({
+            "rule_id": "INSEE", "field": "SIREN", "field_label": "SIREN",
+            "field_value": siren, "expected_value": "Présent au registre INSEE SIRENE",
+            "severity": "MEDIUM", "finding_type": "SIREN absent du registre INSEE",
+            "description": "SIREN introuvable dans le registre national SIRENE (29M+ entreprises)",
+        })
+        return issues
+    if siret and ref.get("siret") and siret != ref["siret"]:
+        issues.append({
+            "rule_id": "INSEE", "field": "SIRET", "field_label": "SIRET",
+            "field_value": siret, "expected_value": ref["siret"],
+            "severity": "HIGH", "finding_type": "SIRET différent du siège INSEE",
+            "description": "Le SIRET fichier ne correspond pas au siège SIRENE",
+        })
+    if company and ref.get("raison_sociale"):
+        c_norm = company.upper()
+        r_norm = str(ref["raison_sociale"]).upper()
+        if c_norm not in r_norm and r_norm not in c_norm:
+            issues.append({
+                "rule_id": "INSEE", "field": "company_name", "field_label": "Raison sociale",
+                "field_value": company, "expected_value": ref["raison_sociale"],
+                "severity": "MEDIUM", "finding_type": "Raison sociale vs INSEE",
+                "description": "Écart entre le nom fichier et la raison sociale SIRENE",
+            })
+    if address and ref.get("adresse"):
+        a_norm = address.upper()[:20]
+        r_addr = ref["adresse"].upper()[:20]
+        if a_norm not in ref["adresse"].upper() and r_addr not in address.upper():
+            issues.append({
+                "rule_id": "INSEE", "field": "address", "field_label": "Adresse",
+                "field_value": address, "expected_value": ref["adresse"],
+                "severity": "MEDIUM", "finding_type": "Adresse vs INSEE",
+                "description": "Adresse fichier différente du siège SIRENE",
+            })
+    if naf and ref.get("naf") and naf.replace(".", "").upper() != ref["naf"].replace(".", "").upper():
+        issues.append({
+            "rule_id": "INSEE", "field": "naf", "field_label": "NAF/APE",
+            "field_value": naf, "expected_value": ref["naf"],
+            "severity": "LOW", "finding_type": "Code NAF vs INSEE",
+            "description": "Code NAF/APE différent du registre INSEE",
+        })
+    return issues
+
+
+def analyze_uploaded_dataframe(
+    df: pd.DataFrame,
+    mapping: dict[str, str | None],
+    source: str = "import",
+    enabled_rules: list[str] | None = None,
+    skip_duplicate_check: bool = False,
+    custom_rules: list[dict] | None = None,
+    skip_name_search: bool = False,
+) -> tuple[list[dict], dict]:
+    anomalies = []
+    seen_siren = {}
+    total = len(df)
+    clean_rows = 0
+    row_prefix = "DB" if source == "snowflake" else "IMP"
+    active_rules = set(enabled_rules or [r["id"] for r in FR_BUSINESS_RULES] + ["INSEE"])
+    custom_rules = custom_rules or []
+    # Auto-load custom rules from Snowflake if none provided (skip if empty to save time)
+    if not custom_rules:
+        try:
+            db_rules = list_custom_rules(active_only=True)
+            custom_rules = [
+                {"id": r["id"], "name": r["name"], "field": r["target_field"],
+                 "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+                 "rule_type": r.get("rule_type", "regex")}
+                for r in db_rules
+            ]
+        except Exception:
+            custom_rules = []
+
+    # Pre-load SIRENE cache: use ALL available identifiers (SIREN, SIRET, TVA) to find companies
+    _sirene_batch_cache: dict = {}
+    _all_sirens_to_lookup = set()
+
+    # Source 1: SIRENs directs du fichier
+    if "INSEE" in active_rules and mapping.get("siren"):
+        siren_col = mapping["siren"]
+        if siren_col in df.columns:
+            all_sirens = df[siren_col].dropna().astype(str).str.strip().str.replace(r'\D', '', regex=True)
+            _all_sirens_to_lookup.update(s for s in all_sirens.unique() if len(s) == 9)
+
+    # Source 2: SIRENs extraits des SIRETs (les 9 premiers chiffres)
+    if "INSEE" in active_rules and mapping.get("siret"):
+        siret_col = mapping["siret"]
+        if siret_col in df.columns:
+            all_sirets = df[siret_col].dropna().astype(str).str.strip().str.replace(r'\D', '', regex=True)
+            _all_sirens_to_lookup.update(s[:9] for s in all_sirets.unique() if len(s) >= 9)
+
+    # Source 3: SIRENs dérivés des TVA (FR + clé + SIREN)
+    if "INSEE" in active_rules and mapping.get("vat"):
+        vat_col = mapping["vat"]
+        if vat_col in df.columns:
+            vat_series = df[vat_col].dropna().astype(str).str.upper().str.replace(" ", "", regex=False)
+            fr_vats = vat_series[vat_series.str.startswith("FR") & (vat_series.str.len() >= 13)]
+            _all_sirens_to_lookup.update(s for s in fr_vats.str[-9:].unique() if s.isdigit() and len(s) == 9)
+
+    # Batch lookup dans SIRENE_SIEGES (pre-built table: 1 row per SIREN, includes address)
+    valid_sirens = list(_all_sirens_to_lookup)
+    _BATCH_CHUNK = 500
+    _SIEGES_TABLE = "QUALITY_TEST.DATA_QUALITY.SIRENE_SIEGES"
+    for _chunk_start in range(0, len(valid_sirens), _BATCH_CHUNK):
+        _chunk = valid_sirens[_chunk_start:_chunk_start + _BATCH_CHUNK]
+        if not _chunk:
+            break
+        siren_list = ",".join(f"'{s}'" for s in _chunk)
+        try:
+            batch_df = _sf_query(f"""
+                SELECT SIREN AS siren, DENOMINATION AS raison_sociale,
+                       NAF AS naf, STATUT AS statut, SIRET_SIEGE AS siret,
+                       CATEGORIE_JURIDIQUE AS categorie_juridique,
+                       VILLE AS ville, CODE_POSTAL AS code_postal, ADRESSE AS adresse
+                FROM {_SIEGES_TABLE}
+                WHERE SIREN IN ({siren_list})
+            """)
+            if not batch_df.empty:
+                for rec in batch_df.to_dict("records"):
+                    _sirene_batch_cache[str(rec.get("siren", ""))] = rec
+        except Exception:
+            pass
+
+    # ========== RECHERCHE INSEE PAR NOM (Cortex Search — embeddings sémantiques) ==========
+    # Pour chaque nom d'entreprise UNIQUE sans SIREN, recherche dans SIRENE (~13M sièges)
+    # via le Cortex Search Service SIRENE_COMPANY_SEARCH (arctic-embed-l-v2.0)
+    _name_resolved: dict = {}  # company_upper -> siren
+    if "INSEE" in active_rules and mapping.get("company_name") and not skip_name_search:
+        _name_col = mapping["company_name"]
+        _siren_col = mapping.get("siren")
+        _city_col = mapping.get("city")
+
+        # Collecter les noms uniques SANS SIREN (ceux qui ont besoin d'enrichissement)
+        _name_series = df[_name_col].fillna("").astype(str).str.strip()
+        _pairs = []
+        _seen_names = set()
+        for _idx in df.index:
+            _n = _name_series.iloc[_idx]
+            if _n and len(_n) >= 3 and _n.upper() not in _seen_names:
+                _seen_names.add(_n.upper())
+                if _siren_col and _siren_col in df.columns:
+                    _s = str(df[_siren_col].iloc[_idx] or "").strip().replace(" ", "")
+                    if _s and len(_s) == 9 and _s in _sirene_batch_cache:
+                        continue
+                _city = ""
+                if _city_col and _city_col in df.columns:
+                    _city = str(df[_city_col].iloc[_idx] or "").strip()
+                _pairs.append((_n, _city))
+
+        # Cortex Search: one call per company name (cached individually by _cortex_search_sirene)
+        if _pairs:
+            for _company_name, _company_city in _pairs:
+                try:
+                    _search_q = _company_name.strip()
+                    if _company_city and len(_company_city) >= 2:
+                        _search_q = f"{_company_name} {_company_city}"
+                    _cs_results = _cortex_search_sirene(_search_q, limit=3, filter_obj={"@eq": {"STATUT": "A"}})
+                    if _cs_results:
+                        _best = _cs_results[0]
+                        if _best.get("_cosine", 0) >= 0.35 and _best.get("siren") and len(_best["siren"]) == 9:
+                            _name_resolved[_company_name.upper().strip()] = _best["siren"]
+                            if _best["siren"] not in _sirene_batch_cache:
+                                _sirene_batch_cache[_best["siren"]] = _best
+                except Exception:
+                    pass
+
+        # Enrich newly resolved SIRENs with full SIRENE_SIEGES data (address, city, etc.)
+        _new_sirens = [s for s in _name_resolved.values() if s not in _all_sirens_to_lookup]
+        for _cs in range(0, len(_new_sirens), _BATCH_CHUNK):
+            _cchunk = _new_sirens[_cs : _cs + _BATCH_CHUNK]
+            if not _cchunk:
+                break
+            _slist = ",".join(f"'{s}'" for s in _cchunk)
+            try:
+                _enrich_df = _sf_query(f"""
+                    SELECT SIREN AS siren, DENOMINATION AS raison_sociale,
+                           NAF AS naf, STATUT AS statut, SIRET_SIEGE AS siret,
+                           CATEGORIE_JURIDIQUE AS categorie_juridique,
+                           VILLE AS ville, CODE_POSTAL AS code_postal, ADRESSE AS adresse
+                    FROM {_SIEGES_TABLE}
+                    WHERE SIREN IN ({_slist})
+                """)
+                if _enrich_df is not None and not _enrich_df.empty:
+                    for rec in _enrich_df.to_dict("records"):
+                        _sirene_batch_cache[str(rec.get("siren", ""))] = rec
+            except Exception:
+                pass
+
+    # Pre-validate mapping: if a mapped column is empty in >90% of rows, un-map it
+    # This prevents false positives when a column doesn't really contain the expected data
+    _sample_size = min(200, len(df))
+    _sample_df = df.head(_sample_size)
+    for _field in ["siren", "siret", "naf", "legal_form", "vat"]:
+        _col = mapping.get(_field)
+        if _col and _col in _sample_df.columns:
+            _non_empty = _sample_df[_col].dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+            if len(_non_empty) < _sample_size * 0.1:
+                mapping[_field] = None  # Un-map: column is mostly empty
+
+    # If vat column was un-mapped or mostly empty, try alternative vat columns (intracom)
+    if not mapping.get("vat"):
+        _vat_aliases_norm = [_norm_col(a) for a in COLUMN_ALIASES["vat"]]
+        for col in df.columns:
+            if col == mapping.get("vat"):
+                continue
+            col_norm = _norm_col(col)
+            if any(alias in col_norm for alias in _vat_aliases_norm if alias):
+                _non_empty = _sample_df[col].dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+                if len(_non_empty) >= _sample_size * 0.1:
+                    mapping["vat"] = col
+                    break
+
+    # ========== VECTORIZED PRE-COMPUTATION ==========
+    # Pre-compute normalized values for all rows to avoid repeated string ops in the loop
+    _NAN_STRINGS = {"NAN", "NEN", "NONE", "NULL", "NA", "N/A", "NANA", "#N/A", "N.A.", ""}
+
+    def _get_col_series(field):
+        col = mapping.get(field)
+        if col and col in df.columns:
+            s = df[col].fillna("").astype(str).str.strip()
+            # Treat pandas NaN artefacts as empty
+            s = s.where(~s.str.upper().isin(_NAN_STRINGS), "")
+            return s
+        return pd.Series([""] * len(df), index=df.index)
+
+    _v_siren = _get_col_series("siren").str.replace(r'\D', '', regex=True)
+    _v_siret = _get_col_series("siret").str.replace(r'\D', '', regex=True)
+    _v_vat = _get_col_series("vat").str.upper().str.replace(" ", "", regex=False)
+    _v_company = _get_col_series("company_name")
+    _v_city = _get_col_series("city")
+    _v_naf = _get_col_series("naf")
+    _v_country = _get_col_series("country").str.upper().str.strip()
+    _v_address = _get_col_series("address")
+    _v_legal = _get_col_series("legal_form")
+    _v_account_id = _get_col_series("account_id")
+
+    # Pre-compute "is French" mask vectorized
+    # IMPORTANT: pays vide = INCONNU (pas français par défaut)
+    # On ne considère français que si: pays explicite FR, ou ville CEDEX, ou TVA FR*, ou trouvé dans INSEE
+    _fr_variants = {"FR", "FRA", "FRANCE", "FRENCH"}
+    _v_explicitly_french = _v_country.isin(_fr_variants) | _v_city.str.contains("CEDEX", case=False, na=False) | _v_vat.str.startswith("FR")
+    # Foreign = has a non-FR country OR has a VAT with a non-FR prefix (NL, BE, DE, etc.)
+    _v_has_foreign_vat = (_v_vat.str.len() >= 4) & ~_v_vat.str.startswith("FR") & (_v_vat != "")
+    _v_explicitly_foreign = ((_v_country != "") & ~_v_country.isin(_fr_variants)) | _v_has_foreign_vat
+    # Rows with unknown country: will be checked via INSEE in the loop
+    _v_is_french = _v_explicitly_french
+
+    # Pre-compute format validity masks (vectorized — no loop needed)
+    _v_siren_valid = _v_siren.str.len() == 9
+    _v_siret_valid = _v_siret.str.len() == 14
+
+    # Pre-build name lookup from batch cache (avoids O(n) scan per row)
+    _name_to_siren_lookup: dict[str, str] = {}
+    for _s, _ref_data in _sirene_batch_cache.items():
+        _rn = str(_ref_data.get("raison_sociale", "")).upper().strip()
+        if _rn:
+            _name_to_siren_lookup[_rn] = _s
+    # Import SequenceMatcher once (not per-row)
+    from difflib import SequenceMatcher as _SeqMatcher
+
+    for idx, row in df.iterrows():
+        row_num = int(idx) + 2  # header = ligne 1
+        row_id = f"{row_prefix}-{row_num:04d}"
+
+        # FAST SKIP: if row is foreign, skip immediately
+        if _v_explicitly_foreign.iloc[idx]:
+            clean_rows += 1
+            continue
+
+        # Use pre-computed vectorized values (much faster than re-parsing each cell)
+        account_id = _v_account_id.iloc[idx] or row_id
+        company = _v_company.iloc[idx] or f"Ligne {row_num}"
+        siren = _v_siren.iloc[idx]
+        siret = _v_siret.iloc[idx]
+        vat = _v_vat.iloc[idx]
+        address = _v_address.iloc[idx]
+        city = _v_city.iloc[idx]
+        naf = _v_naf.iloc[idx]
+        country_raw = _v_country.iloc[idx]
+        legal_form = _v_legal.iloc[idx]
+
+        # Determine if French: explicitly FR, or found in INSEE, or unknown
+        _is_explicitly_fr = _v_is_french.iloc[idx]
+        row_issues = []
+
+        # Try to resolve SIREN from name if available (for providing real expected values)
+        _resolved_siren = ""
+        _resolved_ref = None
+        if company and company.upper() in _name_resolved:
+            _resolved_siren = _name_resolved[company.upper()]
+            _resolved_ref = _sirene_batch_cache.get(_resolved_siren)
+
+        # --- Resolve SIREN for INSEE cross-check ---
+        _derived_siren = ""
+        _derived_ref = None
+        if siren and _valid_siren(siren):
+            _derived_siren = siren
+            _derived_ref = _sirene_batch_cache.get(siren)
+        elif siret and len(re.sub(r'\D', '', siret)) >= 9:
+            _pot = re.sub(r'\D', '', siret)[:9]
+            if len(_pot) == 9:
+                _derived_siren = _pot
+                _derived_ref = _sirene_batch_cache.get(_pot)
+
+        # Determine if account is CONFIRMED French:
+        # - explicitly FR (country column or TVA starts with FR)
+        # - OR found in INSEE registry (via SIREN/SIRET/name lookup)
+        # If not confirmed French → do NOT apply FR-specific rules (TVA FR format, NAF, etc.)
+        _confirmed_french = _is_explicitly_fr or bool(_derived_ref) or bool(_resolved_ref)
+        _is_account_french = _confirmed_french
+        country = "FR" if _confirmed_french else ""
+
+        # Only check SIREN/SIRET if those columns are actually mapped AND account is confirmed French
+        _has_siren_mapped = mapping.get("siren") is not None
+        _has_siret_mapped = mapping.get("siret") is not None
+
+        if (_has_siren_mapped or _has_siret_mapped) and _is_account_french:
+            if not siren and not siret:
+                # Report missing SIREN — with expected value if we found one via name lookup
+                if "R01" in active_rules and _has_siren_mapped:
+                    if _resolved_siren:
+                        row_issues.append({
+                            "rule_id": "R01", "field": "SIREN", "field_label": "SIREN",
+                            "field_value": siren, "expected_value": _resolved_siren,
+                            "severity": "HIGH", "finding_type": "SIREN vide",
+                            "description": f"SIREN trouvé via INSEE : {_resolved_siren}",
+                        })
+                    else:
+                        row_issues.append({
+                            "rule_id": "R01", "field": "SIREN", "field_label": "SIREN",
+                            "field_value": "", "expected_value": "9 chiffres",
+                            "severity": "HIGH", "finding_type": "SIREN vide",
+                            "description": "Le champ SIREN est vide",
+                        })
+                if "R02" in active_rules and _has_siret_mapped:
+                    row_issues.append({
+                        "rule_id": "R02", "field": "SIRET", "field_label": "SIRET",
+                        "field_value": "", "expected_value": "14 chiffres",
+                        "severity": "MEDIUM", "finding_type": "SIRET vide",
+                        "description": "Le champ SIRET est vide",
+                    })
+            else:
+                if _has_siren_mapped and "R01" in active_rules:
+                    if siren and not _valid_siren(siren):
+                        _exp_siren = _resolved_siren or "9 chiffres numériques"
+                        row_issues.append({
+                            "rule_id": "R01", "field": "SIREN", "field_label": "SIREN",
+                            "field_value": siren, "expected_value": _exp_siren,
+                            "severity": "HIGH", "finding_type": "Format SIREN invalide",
+                            "description": f"SIREN officiel INSEE : {_resolved_siren}" if _resolved_siren else f"Le SIREN doit contenir exactement 9 chiffres (trouvé: {len(siren)} chiffres)",
+                        })
+                    elif not siren:
+                        _exp_s = _resolved_siren or "9 chiffres"
+                        row_issues.append({
+                            "rule_id": "R01", "field": "SIREN", "field_label": "SIREN",
+                            "field_value": siren, "expected_value": _exp_s,
+                            "severity": "HIGH", "finding_type": "SIREN vide",
+                            "description": f"SIREN officiel INSEE : {_resolved_siren}" if _resolved_siren else "Le champ SIREN est vide",
+                        })
+                    elif not skip_duplicate_check and siren in seen_siren:
+                        row_issues.append({
+                            "rule_id": "DUP", "field": "SIREN", "field_label": "SIREN",
+                            "field_value": siren, "expected_value": f"Unique (doublon ligne {seen_siren[siren]})",
+                            "severity": "HIGH", "finding_type": "Doublon SIREN dans le fichier",
+                            "description": f"SIREN déjà présent ligne {seen_siren[siren]}",
+                        })
+                    else:
+                        seen_siren[siren] = row_num
+
+                if _has_siret_mapped and "R02" in active_rules:
+                    if siret and not _valid_siret(siret):
+                        _ref_siret = ""
+                        _ref_for_siret = _derived_ref or _resolved_ref
+                        if _ref_for_siret and _ref_for_siret.get("siret"):
+                            _ref_siret = str(_ref_for_siret["siret"])
+                        _exp_siret = _ref_siret or "14 chiffres numériques"
+                        row_issues.append({
+                            "rule_id": "R02", "field": "SIRET", "field_label": "SIRET",
+                            "field_value": siret, "expected_value": _exp_siret,
+                            "severity": "HIGH", "finding_type": "Format SIRET invalide",
+                            "description": f"SIRET officiel INSEE : {_ref_siret}" if _ref_siret else f"Le SIRET doit contenir exactement 14 chiffres (trouvé: {len(siret)} chiffres)",
+                        })
+                    elif not siret:
+                        _ref_for_siret = _derived_ref or _resolved_ref
+                        _ref_siret = str(_ref_for_siret["siret"]) if _ref_for_siret and _ref_for_siret.get("siret") else "14 chiffres"
+                        row_issues.append({
+                            "rule_id": "R02", "field": "SIRET", "field_label": "SIRET",
+                            "field_value": siret, "expected_value": _ref_siret,
+                            "severity": "MEDIUM", "finding_type": "SIRET vide",
+                            "description": "Le champ SIRET est vide",
+                        })
+
+                if "R03" in active_rules and siren and siret and _valid_siren(siren) and _valid_siret(siret) and not _siret_matches_siren(siren, siret):
+                    row_issues.append({
+                        "rule_id": "R03", "field": "SIRET", "field_label": "SIRET",
+                        "field_value": siret, "expected_value": f"{siren} + 5 caractères établissement",
+                        "severity": "HIGH", "finding_type": "Incohérence SIRET / SIREN",
+                        "description": "Les 9 premiers chiffres du SIRET doivent égaler le SIREN",
+                    })
+
+        # R04-R07 — R04 (TVA) only if EXPLICITLY confirmed French (not just found by name in SIRENE)
+        if "R04" in active_rules and mapping.get("vat") and _is_account_french and _is_explicitly_fr:
+            # Get expected TVA from INSEE reference if available (try derived first, then resolved)
+            _ref_for_vat = _derived_ref or _resolved_ref
+            _expected_vat = str(_ref_for_vat.get("tva", "")) if _ref_for_vat and _ref_for_vat.get("tva") else ""
+            # If no TVA in ref but we have a SIREN, compute it
+            if not _expected_vat and (_derived_siren or _resolved_siren):
+                _s = _derived_siren or _resolved_siren
+                _expected_vat = _vat_from_siren(_s) if len(_s) == 9 else ""
+            # Compute expected from row SIREN as last resort
+            if not _expected_vat:
+                # Try from the row's own SIREN field
+                if siren and len(siren) == 9:
+                    _expected_vat = _vat_from_siren(siren)
+                # Try extracting SIREN from SIRET (first 9 digits)
+                if not _expected_vat and siret and len(siret) >= 9:
+                    _siren_from_siret = siret[:9]
+                    _expected_vat = _vat_from_siren(_siren_from_siret)
+                # Try from company_name via pre-built lookup (O(1) instead of O(n))
+                if not _expected_vat and company:
+                    _lookup_s = _name_to_siren_lookup.get(company.upper().strip())
+                    if _lookup_s:
+                        _expected_vat = _vat_from_siren(_lookup_s)
+                # Use pre-resolved name → SIREN mapping (already done in batch before loop)
+                if not _expected_vat and company and company.upper() in _name_resolved:
+                    _resolved = _name_resolved[company.upper()]
+                    if _resolved and len(_resolved) == 9:
+                        _expected_vat = _vat_from_siren(_resolved)
+            if mapping.get("vat") and not vat:
+                # TVA manquante — on utilise la référence INSEE trouvée par vectorisation
+                if _expected_vat:
+                    row_issues.append({
+                        "rule_id": "R04", "field": "VAT_NUMBER", "field_label": "N° TVA intracom",
+                        "field_value": "", "expected_value": _expected_vat,
+                        "severity": "HIGH", "finding_type": "TVA intracom manquante",
+                        "description": f"TVA trouvée via INSEE : {_expected_vat}",
+                    })
+                elif (_derived_siren or _resolved_siren):
+                    _s_for_vat = _derived_siren or _resolved_siren
+                    _computed_vat = _vat_from_siren(_s_for_vat)
+                    if _computed_vat:
+                        row_issues.append({
+                            "rule_id": "R04", "field": "VAT_NUMBER", "field_label": "N° TVA intracom",
+                            "field_value": "", "expected_value": _computed_vat,
+                            "severity": "HIGH", "finding_type": "TVA intracom manquante",
+                            "description": f"TVA enrichie depuis INSEE (SIREN {_s_for_vat})",
+                        })
+                # Pas de référence INSEE trouvée → pas d'anomalie (on ne peut rien affirmer)
+            elif vat and not _valid_vat_fr(vat):
+                # Only report if we have the REAL expected value from INSEE
+                # No concrete reference = no anomaly (we can't affirm anything)
+                _show_expected = _expected_vat
+                if not _show_expected and siren and len(siren) == 9:
+                    _show_expected = _vat_from_siren(siren)
+                if not _show_expected and siret and len(siret) >= 9:
+                    _show_expected = _vat_from_siren(siret[:9])
+                if _show_expected:
+                    row_issues.append({
+                        "rule_id": "R04", "field": "VAT_NUMBER", "field_label": "N° TVA intracom",
+                        "field_value": vat, "expected_value": _show_expected,
+                        "severity": "HIGH", "finding_type": "Format TVA intracom invalide",
+                        "description": f"TVA attendue (INSEE) : {_show_expected}",
+                    })
+            elif vat and _valid_vat_fr(vat) and _expected_vat and vat != _expected_vat:
+                # TVA format OK but doesn't match INSEE reference
+                row_issues.append({
+                    "rule_id": "R04", "field": "VAT_NUMBER", "field_label": "N° TVA intracom",
+                    "field_value": vat, "expected_value": _expected_vat,
+                    "severity": "MEDIUM", "finding_type": "TVA divergente INSEE",
+                    "description": f"TVA différente de la référence INSEE pour le SIREN {_derived_siren}",
+                })
+
+        # R06 — format NAF/APE (only for confirmed French accounts)
+        if "R06" in active_rules and mapping.get("naf") and _is_account_french:
+            _ref_naf = ""
+            _crossref_for_naf = _derived_ref or _resolved_ref
+            if _crossref_for_naf and _crossref_for_naf.get("naf"):
+                _ref_naf = str(_crossref_for_naf["naf"])
+            if naf:
+                if not _valid_naf(naf):
+                    _expected_naf = _ref_naf if _ref_naf else "XX.XXZ (ex : 6202A)"
+                    row_issues.append({
+                        "rule_id": "R06", "field": "NAF", "field_label": "Code NAF/APE",
+                        "field_value": naf, "expected_value": _expected_naf,
+                        "severity": "MEDIUM", "finding_type": "Format NAF/APE invalide",
+                        "description": f"Code NAF officiel INSEE : {_ref_naf}" if _ref_naf else "Le code NAF/APE doit respecter le format XXXXZ (4 chiffres + 1 lettre)",
+                    })
+            elif not naf:
+                _expected_naf = _ref_naf if _ref_naf else "XX.XXZ"
+                row_issues.append({
+                    "rule_id": "R06", "field": "NAF", "field_label": "Code NAF/APE",
+                    "field_value": "", "expected_value": _expected_naf,
+                    "severity": "LOW", "finding_type": "Code NAF/APE absent",
+                    "description": "Le code NAF/APE est requis pour les comptes FR",
+                })
+
+        # R07 — forme juridique (only for French accounts)
+        if "R07" in active_rules and mapping.get("legal_form") and _is_account_french:
+            if not legal_form:
+                extracted = _extract_legal_form(company)
+                if not extracted:
+                    row_issues.append({
+                        "rule_id": "R07", "field": "LEGAL_FORM", "field_label": "Forme juridique",
+                        "field_value": "", "expected_value": "SA, SAS, SARL, SE…",
+                        "severity": "MEDIUM", "finding_type": "Forme juridique manquante",
+                        "description": "Champ forme juridique vide et non déductible du nom commercial",
+                    })
+
+        # Custom rules (supports regex, not_empty, in_list, length)
+        for cr in custom_rules:
+            field = cr.get("field", "")
+            col = mapping.get(field)
+            if not col or col not in row.index:
+                continue
+            raw_val = _cell_str(row[col])
+            # Skip empty values for format rules (empty != invalid format)
+            rule_type = cr.get("rule_type", "regex")
+            pattern = cr.get("pattern", "")
+            if not raw_val and rule_type != "not_empty":
+                continue
+            if rule_type == "not_empty":
+                failed = not raw_val.strip()
+                expected = "Non vide"
+            elif rule_type == "in_list":
+                allowed = [v.strip().upper() for v in pattern.split(",") if v.strip()]
+                failed = raw_val.strip().upper() not in allowed
+                expected = f"Valeur parmi : {pattern}"
+            elif rule_type == "length":
+                parts = pattern.split(":")
+                mn = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+                mx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 9999
+                failed = not (mn <= len(raw_val) <= mx)
+                expected = f"Longueur entre {mn} et {mx}"
+            else:  # regex
+                failed = (not raw_val.strip()) if not pattern else not re.search(pattern, raw_val)
+                # Show human-readable description, not the raw regex
+                expected = cr.get("description") or cr.get("name") or pattern or "Non vide"
+            if failed:
+                row_issues.append({
+                    "rule_id": cr["id"], "field": field,
+                    "field_label": IMPORT_FIELD_LABELS.get(field, field),
+                    "field_value": raw_val, "expected_value": expected,
+                    "severity": cr.get("severity", "MEDIUM"),
+                    "finding_type": cr.get("name", "Règle personnalisée"),
+                    "description": f"Règle personnalisée {cr['id']} non respectée",
+                })
+
+        # --- Generic INSEE cross-validation: compare ALL available fields against reference ---
+        # Use derived ref (from SIREN/SIRET) OR resolved ref (from name lookup)
+        _crossref = _derived_ref or _resolved_ref
+        if "INSEE" in active_rules and _is_account_french and _crossref:
+            _ref = _crossref
+            _ref_siren = _derived_siren or _resolved_siren or str(_ref.get("siren", ""))
+
+            # --- ENRICHISSEMENT : champs VIDES qu'on peut combler via INSEE ---
+            # SIREN vide mais trouvé via vectorisation/autres champs
+            if _has_siren_mapped and not siren and _ref_siren:
+                row_issues.append({
+                    "rule_id": "INSEE", "field": "SIREN", "field_label": "SIREN",
+                    "field_value": "", "expected_value": _ref_siren,
+                    "severity": "HIGH", "finding_type": "SIREN enrichi via INSEE",
+                    "description": f"SIREN trouvé dans INSEE : {_ref_siren}",
+                })
+            # NAF vide mais disponible dans INSEE
+            if mapping.get("naf") and not naf and _ref.get("naf"):
+                row_issues.append({
+                    "rule_id": "INSEE", "field": "NAF", "field_label": "Code NAF",
+                    "field_value": "", "expected_value": str(_ref["naf"]),
+                    "severity": "MEDIUM", "finding_type": "NAF enrichi via INSEE",
+                    "description": f"Code NAF officiel INSEE : {_ref['naf']}",
+                })
+
+            # --- DIVERGENCES : champs qui ont une valeur DIFFERENTE d'INSEE ---
+            # Compare SIREN
+            if _has_siren_mapped and siren and _ref_siren and siren != _ref_siren:
+                row_issues.append({
+                    "rule_id": "INSEE", "field": "SIREN", "field_label": "SIREN",
+                    "field_value": siren, "expected_value": _ref_siren,
+                    "severity": "HIGH", "finding_type": "SIREN divergent INSEE",
+                    "description": f"SIREN officiel INSEE : {_ref_siren}",
+                })
+            # Compare SIRET
+            if _has_siret_mapped and siret and _ref.get("siret") and siret != str(_ref["siret"]):
+                row_issues.append({
+                    "rule_id": "INSEE", "field": "SIRET", "field_label": "SIRET",
+                    "field_value": siret, "expected_value": str(_ref["siret"]),
+                    "severity": "MEDIUM", "finding_type": "SIRET divergent INSEE",
+                    "description": f"SIRET siège INSEE : {_ref['siret']}",
+                })
+            # Compare city
+            if mapping.get("city") and city and _ref.get("ville"):
+                _city_ref = str(_ref["ville"]).upper().strip()
+                _city_file = city.upper().strip()
+                if _city_file not in _city_ref and _city_ref not in _city_file:
+                    row_issues.append({
+                        "rule_id": "INSEE", "field": "CITY", "field_label": "Ville",
+                        "field_value": city, "expected_value": _ref["ville"],
+                        "severity": "MEDIUM", "finding_type": "Ville divergente INSEE",
+                        "description": f"Ville officielle INSEE : {_ref['ville']}",
+                    })
+            # Compare NAF (non-vide mais different)
+            if mapping.get("naf") and naf and _ref.get("naf"):
+                if naf.replace(".", "").upper() != str(_ref["naf"]).replace(".", "").upper():
+                    row_issues.append({
+                        "rule_id": "INSEE", "field": "NAF", "field_label": "Code NAF",
+                        "field_value": naf, "expected_value": str(_ref["naf"]),
+                        "severity": "LOW", "finding_type": "NAF divergent INSEE",
+                        "description": f"Code NAF officiel : {_ref['naf']}",
+                    })
+            # Compare address
+            if mapping.get("address") and address and _ref.get("adresse"):
+                _addr_ref = str(_ref["adresse"]).upper()[:30]
+                _addr_file = address.upper()[:30]
+                if _addr_file not in str(_ref["adresse"]).upper() and _addr_ref not in address.upper():
+                    row_issues.append({
+                        "rule_id": "INSEE", "field": "ADDRESS", "field_label": "Adresse",
+                        "field_value": address, "expected_value": _ref["adresse"],
+                        "severity": "LOW", "finding_type": "Adresse divergente INSEE",
+                        "description": f"Adresse siège INSEE : {_ref['adresse']}",
+                    })
+            # Entreprise fermée
+            if _ref.get("statut") and str(_ref["statut"]).upper() != "A":
+                row_issues.append({
+                    "rule_id": "INSEE", "field": "SIREN", "field_label": "Statut",
+                    "field_value": _ref_siren, "expected_value": "Active (A)",
+                    "severity": "HIGH", "finding_type": "Entreprise fermée / radiée",
+                    "description": "Entreprise inactive selon le registre SIRENE",
+                })
+            # Raison sociale très différente
+            if company and _ref.get("raison_sociale"):
+                _sim = _SeqMatcher(None, company.upper()[:30], str(_ref["raison_sociale"]).upper()[:30]).ratio()
+                if _sim < 0.4:
+                    row_issues.append({
+                        "rule_id": "INSEE", "field": "COMPANY_NAME", "field_label": "Raison sociale",
+                        "field_value": company, "expected_value": str(_ref["raison_sociale"]),
+                        "severity": "LOW", "finding_type": "Nom divergent INSEE",
+                        "description": f"Nom officiel INSEE : {_ref['raison_sociale']}",
+                    })
+        elif "INSEE" in active_rules and _is_account_french and (_derived_siren or _resolved_siren) and not _crossref:
+            # SIREN found but not in SIRENE registry
+            row_issues.append({
+                "rule_id": "INSEE", "field": "SIREN", "field_label": "SIREN",
+                "field_value": _derived_siren, "expected_value": "Présent au registre SIRENE",
+                "severity": "MEDIUM", "finding_type": "SIREN absent du registre",
+                "description": "SIREN introuvable dans le registre national",
+            })
+
+        if not row_issues:
+            clean_rows += 1
+
+        for j, issue in enumerate(row_issues):
+            anomalies.append({
+                "id": f"{row_id}-{issue['rule_id']}-{j}",
+                "account_id": account_id,
+                "company_name": company,
+                "row_num": row_num,
+                "source": source,
+                "status": "Open",
+                **issue,
+            })
+
+    # Vectorized einvoicing_ready count (no second iterrows loop)
+    _einv_ready = 0
+    if mapping.get("siren") and mapping.get("siret"):
+        _einv_ready = int((_v_siren_valid & _v_siret_valid & (_v_siret.str[:9] == _v_siren)).sum())
+
+    stats = {
+        "total_rows": total,
+        "anomaly_count": len(anomalies),
+        "affected_rows": total - clean_rows,
+        "clean_rows": clean_rows,
+        "einvoicing_ready": _einv_ready,
+        "score": round(clean_rows / total * 100) if total else 0,
+        "active_rules": sorted(active_rules),
+    }
+    return anomalies, stats
+
+
+def get_all_fr_anomalies():
+    """Anomalies backend (DQ_FINDINGS) + anomalies analyse session (fichier ou table)."""
+    # Load from DQ_FINDINGS database — filtered by current source
+    _current_fqn = _dim_account_fqn().upper()
+    _current_table = st.session_state.get("sf_table", "").upper()
+    db_findings = load_dq_findings(_current_fqn) if _current_fqn and _current_fqn != "..DIM_ACCOUNT" else []
+    # Also try file source if available
+    _file_source = st.session_state.get("wizard_file_upload", "")
+    if _file_source:
+        db_findings = db_findings + load_dq_findings(_file_source)
+    db_anomalies = []
+    for f in db_findings:
+        db_anomalies.append({
+            "id": f.get("id", ""),
+            "account_id": _cell_str(f.get("account_id", "")),
+            "company_name": _cell_str(f.get("company_name", "")),
+            "rule_id": _cell_str(f.get("rule_id", "")),
+            "field": _cell_str(f.get("field", "")),
+            "field_label": _cell_str(f.get("field_label", "")),
+            "field_value": _cell_str(f.get("field_value", "")),
+            "expected_value": _cell_str(f.get("expected_value", "")),
+            "severity": _cell_str(f.get("severity", "MEDIUM")) or "MEDIUM",
+            "finding_type": _cell_str(f.get("finding_type", "")),
+            "description": _cell_str(f.get("description", "")),
+            "status": _cell_str(f.get("status", "Open")) or "Open",
+            "source": "snowflake",
+        })
+    # Also include session-uploaded anomalies — these take priority over DB (most recent state)
+    uploaded = st.session_state.get("fr_upload_anomalies", [])
+    if uploaded:
+        # Session anomalies are authoritative — use them first, then add DB-only findings
+        seen_ids = {a["id"] for a in uploaded}
+        result = list(uploaded)
+        for a in db_anomalies:
+            if a["id"] not in seen_ids:
+                result.append(a)
+        return result
+    return db_anomalies
+
+
+
+def compute_fr_sla(anomalies: list, total: int) -> list:
+    """Recalcule les SLA R01-R08 à partir des anomalies de la dernière analyse."""
+    if not anomalies or not total:
+        return [{**rule, "ok": total or 0, "total": total or 0, "sla_pct": 100 if total else 0} for rule in FR_BUSINESS_RULES]
+    fail_accounts: dict[str, set] = {}
+    for a in anomalies:
+        rid = a.get("rule_id", "")
+        key = str(a.get("account_id") or a.get("row_num", ""))
+        fail_accounts.setdefault(rid, set()).add(key)
+    fr_stats = st.session_state.get("fr_upload_stats", {})
+    einvoicing_ready = fr_stats.get("einvoicing_ready", 0)
+    if not einvoicing_ready and total:
+        # Compute from findings: e-facturation ready = accounts without R01, R02, R03 failures
+        r01_r02_r03_fails = fail_accounts.get("R01", set()) | fail_accounts.get("R02", set()) | fail_accounts.get("R03", set())
+        einvoicing_ready = max(0, total - len(r01_r02_r03_fails))
+    result = []
+    for rule in FR_BUSINESS_RULES:
+        rid = rule["id"]
+        if rid == "R08":
+            ok = einvoicing_ready
+        else:
+            fails = len(fail_accounts.get(rid, set()))
+            ok = max(0, total - fails)
+        sla = round(ok / total * 100) if total else 0
+        result.append({**rule, "ok": ok, "total": total, "sla_pct": sla})
+    return result
+
+
+def _run_wizard_analysis(selected_subjects: list) -> dict:
+    """Compute wizard summary stats from DQ_FINDINGS filtered by selected subjects."""
+    subject_rule_map: dict[str, set] = {
+        "compliance": {"R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08", "INSEE"},
+        "duplicates": {"DUP"},
+        "address": {"ADDR"},
+        "web": {"WEB"},
+    }
+    active_rules: set = set()
+    for subj in selected_subjects:
+        active_rules |= subject_rule_map.get(subj, set())
+    findings = get_findings()
+    relevant = [f for f in findings if f.get("rule_id") in active_rules]
+    records = len(load_dim_account(_dim_account_fqn())) or 1
+    affected_ids = {f["account_id"] for f in relevant if f["status"] in ("Open", "In Review")}
+    clean = records - len(affected_ids)
+    score = round(clean / records * 100) if records else 0
+    high = sum(1 for f in relevant if f["severity"] == "HIGH")
+    med = sum(1 for f in relevant if f["severity"] == "MEDIUM")
+    low = sum(1 for f in relevant if f["severity"] == "LOW")
+    return {
+        "total_rows": records,
+        "anomaly_count": len(relevant),
+        "affected_rows": len(affected_ids),
+        "clean_rows": clean,
+        "score": score,
+        "high": high,
+        "med": med,
+        "low": low,
+        "active_rules": sorted(active_rules),
+        "duration_s": 0,  # Will be measured during actual execution
+    }
+
+
+def _store_analysis_results(anomalies: list, stats: dict, label: str, source: str):
+    st.session_state["fr_upload_anomalies"] = anomalies
+    st.session_state["fr_upload_stats"] = stats
+    st.session_state["fr_upload_filename"] = label
+    st.session_state["fr_data_source"] = source
+    st.session_state["fr_scan_done"] = True
+    st.session_state["usage_lines"] = st.session_state.get("usage_lines", 0) + stats.get("total_rows", 0)
+    st.session_state["usage_rules"] = st.session_state.get("usage_rules", 0) + len(stats.get("active_rules", []))
+    st.session_state["usage_refs"] = st.session_state.get("usage_refs", 0) + stats.get("total_rows", 0)
+
+    # Purge old findings for this source before inserting new ones
+    _src_table = st.session_state.get("import_wizard_table", label)
+    try:
+        _sf_execute(
+            "DELETE FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS WHERE source_table = %(src)s",
+            params={"src": _src_table}
+        )
+    except Exception:
+        pass
+
+    # Persist new anomalies to DQ_FINDINGS table — ONE batch insert (not N individual inserts)
+    if anomalies:
+        # Build batch VALUES for a single INSERT
+        _batch_size = 50
+        for _bi in range(0, len(anomalies), _batch_size):
+            _batch = anomalies[_bi:_bi+_batch_size]
+            _values_parts = []
+            _params = {}
+            for _j, a in enumerate(_batch):
+                _pk = f"b{_bi}_{_j}"
+                _values_parts.append(
+                    f"(%(id_{_pk})s, %(aid_{_pk})s, %(name_{_pk})s, %(sev_{_pk})s, 'Open', 'Compliance', "
+                    f"%(rid_{_pk})s, %(field_{_pk})s, %(fl_{_pk})s, %(fv_{_pk})s, %(ev_{_pk})s, %(ft_{_pk})s, %(desc_{_pk})s, %(src_{_pk})s)"
+                )
+                _params.update({
+                    f"id_{_pk}": a["id"], f"aid_{_pk}": a.get("account_id", ""),
+                    f"name_{_pk}": a.get("company_name", ""), f"sev_{_pk}": a.get("severity", "MEDIUM"),
+                    f"rid_{_pk}": a.get("rule_id", ""), f"field_{_pk}": a.get("field", ""),
+                    f"fl_{_pk}": a.get("field_label", ""), f"fv_{_pk}": str(a.get("field_value", ""))[:500],
+                    f"ev_{_pk}": str(a.get("expected_value", ""))[:500], f"ft_{_pk}": a.get("finding_type", ""),
+                    f"desc_{_pk}": a.get("description", "")[:1000], f"src_{_pk}": label,
+                })
+            _values_sql = ",\n".join(_values_parts)
+            try:
+                _sf_execute(
+                    f"INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS "
+                    f"(id, account_id, company_name, severity, status, subject, rule_id, "
+                    f"field, field_label, field_value, expected_value, finding_type, description, source_table) "
+                    f"VALUES {_values_sql}",
+                    _params,
+                )
+            except Exception:
+                pass
+        load_dq_findings.clear()
+
+    # Archive this analysis run to history table
+    _src_type = "file" if source == "file" or st.session_state.get("source_mode") == "file" else "snowflake"
+    try:
+        write_analysis_history(stats, label, _src_type)
+    except Exception:
+        pass
+
+
+def _render_detection_pipeline_help():
+    with st.expander("Comment fonctionne la détection et l'analyse ?", expanded=False):
+        st.markdown("""
+**Les deux sources passent par le même moteur d'analyse** — seule l'étape de chargement change.
+
+| Étape | Table Snowflake | Fichier CSV / Excel |
+|-------|-----------------|---------------------|
+| **1. Chargement** | Table choisie (`DIM_ACCOUNT` par défaut) · mapping colonnes **fixe** | Upload · parsing auto (CSV `;` `,` tab · Excel) |
+| **2. Mapping** | Colonnes prédéfinies (`siren`, `siret`, `company_name`, `forme_juridique`…) | **Détection auto** des en-têtes + ajustement manuel |
+| **3. Règles R01–R08** | Format SIREN, SIRET, cohérence, TVA, pays, NAF, forme juridique, e-fact. | Idem |
+| **4. Croisement INSEE** | Registre SIRENE réel (29M+ entreprises, Marketplace) | Idem |
+| **5. Dédoublonnage** | SQL `ROW_NUMBER()` sur clés configurables (SIREN, SIRET…) | Idem (staging Snowflake) |
+| **6. Résultats** | Score avant/après · aperçu données nettoyées · centre de résolution | Idem |
+
+**Détection auto des colonnes (fichiers)** — on normalise chaque en-tête (`Raison Sociale` → `raison_sociale`) et on le compare à une liste d'alias :
+`siren`, `num_siren`, `siret`, `raison_sociale`, `tva_intra`, `adresse`, `naf`, `code_ape`, `forme_juridique`…
+
+**Règles appliquées ligne par ligne :**
+- **R01** SIREN = 9 chiffres · **R02** SIRET = 14 chiffres · **R03** SIRET commence par SIREN
+- **R04** TVA `FR` + 11 caractères · **R05** Code pays = FR (comptes domestiques)
+- **R06** Format NAF/APE `XXXXZ` · **R07** Forme juridique renseignée (SA, SAS, SARL…)
+- **R08** Prêt e-facturation (SIREN + SIRET valides + cohérents pour PDP) — dérivé de R01–R03
+- **Doublons** : dédoublonnage **automatique** (configurable) · plus de flood d'anomalies DUP
+- **Règles personnalisées** : regex ou champ obligatoire sur colonnes mappées
+- **INSEE** comparaison nom / adresse / NAF vs registre SIRENE national
+
+> Connexion Snowflake réelle et API INSEE live : configuré.
+        """)
+
+
+def _render_mapping_table(mapping: dict[str, str | None], detected: dict[str, str | None] | None = None):
+    rows = ""
+    for field, label in IMPORT_FIELD_LABELS.items():
+        col = mapping.get(field)
+        if detected is not None:
+            auto = detected.get(field)
+            status = (
+                '<span class="qx-badge qx-badge-match">Auto</span>'
+                if auto and auto == col
+                else ('<span class="qx-badge qx-badge-warn">Ajusté</span>' if col else '<span class="qx-badge qx-badge-error">—</span>')
+            )
+        else:
+            status = '<span class="qx-badge qx-badge-match">Fixe</span>' if col else '<span class="qx-badge qx-badge-error">—</span>'
+        rows += (
+            f"<tr><td>{html.escape(label)}</td>"
+            f"<td><code>{html.escape(col) if col else '—'}</code></td>"
+            f"<td>{status}</td></tr>"
+        )
+    st.markdown(
+        f'<div class="qx-card" style="overflow-x:auto;font-size:0.85rem;">'
+        f'<table style="width:100%;border-collapse:collapse;">'
+        f'<thead><tr style="border-bottom:1px solid var(--border);">'
+        f'<th style="text-align:left;padding:6px;">Champ métier</th>'
+        f'<th style="text-align:left;padding:6px;">Colonne source</th>'
+        f'<th style="text-align:left;padding:6px;">Statut</th>'
+        f'</tr></thead><tbody>{rows}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _fr_tab_source_analyse():
+    t = get_theme()
+    accent = t['accent']
+
+    # Premium section header with accent bar
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Source & analyse</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Table Snowflake ou CSV — moteur exécuté sur Snowflake (staging + SQL + INSEE).</div>'
+        f'</div>'
+        f'<span style="font-size:0.62rem;padding:3px 10px;background:{t["accent_soft"]};color:{accent};border-radius:999px;font-weight:600;margin-left:auto;">Snowflake connecté</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    _render_detection_pipeline_help()
+
+    enabled_rules = _render_rules_and_dedup_config("fr")
+    auto_dedup = st.session_state.get("fr_auto_dedup", True)
+    dedup_keys = st.session_state.get("fr_dedup_keys", DEFAULT_DEDUP_KEYS)
+    dedup_strategy = st.session_state.get("fr_dedup_strategy", "keep_first")
+    custom_rules = [
+        {"id": r["id"], "name": r["name"], "field": r["target_field"],
+         "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+         "rule_type": r.get("rule_type", "regex")}
+        for r in list_custom_rules(active_only=True)
+    ]
+
+    st.markdown("---")
+    # Table Snowflake section with icon card
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+        f'<div style="width:28px;height:28px;border-radius:8px;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;">'
+        f'<svg width="14" height="14" fill="none" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="{accent}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        f'</div>'
+        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Table Snowflake</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    primary_table = _dim_account_fqn()
+    st.caption(f"Table principale (sidebar) : `{primary_table}`")
+
+    extra_tables = [tbl for tbl in FR_AUDIT_TABLES if tbl != primary_table]
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+        analyze_primary = st.button("Analyser la table principale", type="primary", key="fr_run_sf_primary")
+    with col_t2:
+        extra_table = st.selectbox(
+            "Autre table (règles différentes)",
+            ["— Aucune —"] + extra_tables + [
+                t for t in [
+                    f"{st.session_state.get('sf_database', 'EDW_DB_SANDBOX')}."
+                    f"{st.session_state.get('sf_schema', 'HAZOURLI')}."
+                    f"{st.session_state.get('sf_table', 'DIM_ACCOUNT')}"
+                ] if t not in FR_AUDIT_TABLES
+            ],
+            key="fr_extra_table",
+        )
+        analyze_extra = st.button("Analyser cette table", key="fr_run_sf_extra", disabled=(extra_table == "— Aucune —"))
+
+    # --- Uploaded file analysis ---
+    _has_upload = st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state
+    analyze_upload = False
+    if _has_upload:
+        _up_name = st.session_state.get("uploaded_filename", "fichier")
+        _up_len = len(st.session_state["uploaded_df"])
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin:12px 0;">'
+            f'<span style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">📂 Fichier uploadé : </span>'
+            f'<code>{_up_name}</code> · <span style="color:{t["text_secondary"]};">{_up_len} lignes</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        analyze_upload = st.button("Analyser le fichier uploadé", type="primary", key="fr_run_upload", use_container_width=True)
+
+    if analyze_upload:
+        _upload_df = st.session_state["uploaded_df"].copy()
+        _upload_df.columns = [c.lower().strip() for c in _upload_df.columns]
+        mapping = _mapping_for_table("uploaded_file", list(_upload_df.columns))
+        with st.spinner(f"Analyse fichier · {st.session_state.get('uploaded_filename', '')}…"):
+            anomalies, stats, df_orig, df_clean, df_removed = run_snowflake_dq_analysis(
+                st.session_state.get("uploaded_filename", "fichier"),
+                mapping, enabled_rules, dedup_keys, auto_dedup, dedup_strategy, custom_rules,
+                df_override=_upload_df,
+            )
+        _store_analysis_results(anomalies, stats, st.session_state.get("uploaded_filename", "fichier"), "import")
+        st.session_state["fr_clean_df"] = df_clean
+        st.session_state["fr_removed_df"] = df_removed
+        add_audit_entry("Analyse fichier uploadé", f"{st.session_state.get('uploaded_filename', '')} · {stats.get('anomaly_count', 0)} anomalies")
+        st.toast(f"{stats.get('anomaly_count', 0)} anomalie(s) · score {stats.get('score', 0)}%")
+        st.rerun()
+    elif analyze_primary or analyze_extra:
+        target = primary_table if analyze_primary else extra_table
+        # Load actual columns for proper mapping detection
+        _target_df = _sf_query(f"SELECT * FROM {target} LIMIT 1")
+        _target_cols = list(_target_df.columns) if not _target_df.empty else None
+        mapping = _mapping_for_table(target, _target_cols)
+        with st.spinner(f"Analyse Snowflake · {target}…"):
+            anomalies, stats, df_orig, df_clean, df_removed = run_snowflake_dq_analysis(
+                target, mapping, enabled_rules, dedup_keys, auto_dedup, dedup_strategy, custom_rules,
+            )
+        _store_analysis_results(anomalies, stats, target.split(".")[-1], "snowflake")
+        st.session_state["fr_clean_df"] = df_clean
+        st.session_state["fr_removed_df"] = df_removed
+        add_audit_entry("Analyse table Snowflake", f"{target} · {stats.get('anomaly_count', 0)} anomalies · engine=snowflake")
+        st.toast(f"{stats.get('anomaly_count', 0)} anomalie(s) · score {stats.get('score', 0)}%")
+        st.rerun()
+
+    # Preview table Snowflake
+    with st.expander(f"Aperçu · {primary_table}", expanded=False):
+        preview_df = load_table_as_dataframe(primary_table)
+        if preview_df.empty:
+            st.info("Table vide ou inaccessible.")
+        else:
+            st.dataframe(preview_df.head(10), use_container_width=True, hide_index=True)
+            mapping_preview = _mapping_for_table(primary_table, list(preview_df.columns))
+            _render_mapping_table(mapping_preview)
+
+    st.markdown("---")
+    # Import file section with icon
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+        f'<div style="width:28px;height:28px;border-radius:8px;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;">'
+        f'<svg width="14" height="14" fill="none" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12" stroke="{accent}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        f'</div>'
+        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Import fichier CSV / Excel</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    uploaded = st.file_uploader(
+        "Fichier clients (CSV, TSV, Excel)",
+        type=["csv", "txt", "tsv", "xlsx", "xls", "xlsm"],
+        key="fr_file_upload",
+    )
+
+    col_dl, _ = st.columns([1, 2])
+    with col_dl:
+        st.download_button(
+            "Télécharger modèle CSV",
+            "account_id;raison_sociale;siren;siret;tva_intra;adresse;naf;pays\n"
+            "ACC-001;Bouygues SA;552032534;55203253400028;FR27552032534;32 Avenue Hoche Paris;4120A;FR\n"
+            "ACC-002;TotalEnergies SE;542051180;54205118000127;;2 Place Jean Millier;0610Z;FR\n"
+            "ACC-003;Test Invalid;123;55203253400099;FRBAD;1 rue test;0000Z;FR\n",
+            file_name="modele_import_fr.csv",
+            mime="text/csv",
+            key="fr_template_csv",
+        )
+
+    if not uploaded:
+        st.markdown(
+            '<div class="qx-card" style="text-align:center;color:var(--text-secondary);">'
+            "Déposez un CSV ou Excel — les colonnes seront détectées automatiquement</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        try:
+            df_raw = load_uploaded_file(uploaded)
+        except ValueError as exc:
+            st.error(str(exc))
+            df_raw = None
+
+        if df_raw is not None:
+            st.success(f"**{uploaded.name}** · {len(df_raw)} lignes · {len(df_raw.columns)} colonnes")
+
+            # Option to persist as Snowflake table
+            with st.expander("Créer une table Snowflake à partir du fichier", expanded=False):
+                _db = st.session_state.get("sf_database", "")
+                _sch = st.session_state.get("sf_schema", "")
+                default_name = uploaded.name.rsplit(".", 1)[0].upper().replace(" ", "_").replace("-", "_")
+                tbl_name = st.text_input("Nom de la table", value=default_name, key="csv_table_name")
+                target_fqn = f"{_db}.{_sch}.{tbl_name}"
+                st.caption(f"La table sera créée dans `{target_fqn}`")
+                if st.button("Créer la table sur Snowflake", type="primary", key="csv_to_sf"):
+                    with st.spinner(f"Écriture de {len(df_raw)} lignes dans {target_fqn}..."):
+                        ok = stage_dataframe_to_snowflake(df_raw, target_fqn)
+                    if ok:
+                        st.success(f"Table `{target_fqn}` créée avec {len(df_raw)} lignes.")
+                        list_snowflake_tables.clear()
+                        # Clear old analysis results
+                        for _k in ["fr_anomalies", "fr_last_stats", "fr_clean_df", "fr_removed_df",
+                                   "fr_upload_anomalies", "fr_upload_stats", "fr_upload_filename",
+                                   "fr_data_source", "fr_scan_done"]:
+                            st.session_state.pop(_k, None)
+                        add_audit_entry("Table créée depuis CSV", f"{uploaded.name} → {target_fqn}")
+                        st.rerun()
+                    else:
+                        st.error("Erreur lors de la création de la table.")
+
+            with st.expander("Colonnes détectées dans le fichier", expanded=False):
+                st.code(", ".join(df_raw.columns.tolist()))
+            st.dataframe(df_raw.head(8), use_container_width=True, hide_index=True)
+
+            # 1. AI-based mapping (handles any file/column names)
+            with st.spinner("Détection intelligente des colonnes (Cortex AI)…"):
+                ai_map = detect_column_mapping_ai(tuple(df_raw.columns))
+            # 2. Alias-based mapping (reliable for known patterns)
+            alias_map = detect_column_mapping(list(df_raw.columns))
+            # 3. Merge: alias overrides AI when it finds a match (more precise)
+            auto_map = {field: None for field in IMPORT_FIELD_LABELS}
+            for field in auto_map:
+                if alias_map.get(field):
+                    auto_map[field] = alias_map[field]
+                elif ai_map.get(field):
+                    auto_map[field] = ai_map[field]
+
+            # 4. Content-based validation: check digit length to fix SIREN vs SIRET confusion
+            def _detect_digit_length(col_name: str, df: pd.DataFrame, sample_size: int = 50) -> int:
+                """Return the most common digit-only length in a column (0 if not numeric)."""
+                if col_name not in df.columns:
+                    return 0
+                sample = df[col_name].dropna().head(sample_size)
+                lengths = sample.astype(str).str.replace(r'\D', '', regex=True).str.len()
+                lengths = lengths[lengths > 0]
+                if lengths.empty:
+                    return 0
+                return int(lengths.mode().iloc[0]) if not lengths.mode().empty else 0
+
+            # If SIREN column actually has 14 digits → it's SIRET
+            siren_col = auto_map.get("siren")
+            siret_col = auto_map.get("siret")
+            if siren_col and not siret_col:
+                digit_len = _detect_digit_length(siren_col, df_raw)
+                if digit_len >= 14:
+                    auto_map["siret"] = siren_col
+                    auto_map["siren"] = None
+            # If SIRET column actually has 9 digits → it's SIREN
+            elif siret_col and not siren_col:
+                digit_len = _detect_digit_length(siret_col, df_raw)
+                if digit_len == 9:
+                    auto_map["siren"] = siret_col
+                    auto_map["siret"] = None
+            st.markdown("##### Mapping colonnes (détection Cortex AI)")
+            st.caption("Les colonnes sont mappées par intelligence artificielle (Cortex). Ajustez ci-dessous si besoin.")
+
+            cols = list(df_raw.columns)
+            mapping = {}
+            map_cols = st.columns(4)
+            fields_order = list(IMPORT_FIELD_LABELS.keys())
+            for i, field in enumerate(fields_order):
+                with map_cols[i % 4]:
+                    options = ["— Non mappé —"] + cols
+                    default_col = auto_map.get(field)
+                    default_idx = options.index(default_col) if default_col in options else 0
+                    chosen = st.selectbox(
+                        IMPORT_FIELD_LABELS[field],
+                        options,
+                        index=default_idx,
+                        key=f"fr_map_{field}",
+                    )
+                    mapping[field] = None if chosen == "— Non mappé —" else chosen
+
+            _render_mapping_table(mapping, detected=auto_map)
+
+            # Show which rules will apply based on mapped columns
+            _applicable_rules = []
+            _missing_critical = []
+            if mapping.get("siren"):
+                _applicable_rules.append("R01 SIREN")
+            else:
+                _missing_critical.append("SIREN")
+            if mapping.get("siret"):
+                _applicable_rules.append("R02 SIRET")
+            else:
+                _missing_critical.append("SIRET")
+            if mapping.get("siren") and mapping.get("siret"):
+                _applicable_rules.append("R03 Cohérence")
+            if mapping.get("vat"):
+                _applicable_rules.append("R04 TVA")
+            else:
+                _missing_critical.append("TVA")
+            if mapping.get("country") or mapping.get("city"):
+                _applicable_rules.append("Filtre pays FR")
+            if mapping.get("naf"):
+                _applicable_rules.append("R06 NAF")
+            if mapping.get("legal_form"):
+                _applicable_rules.append("R07 Forme juridique")
+            if mapping.get("siren"):
+                _applicable_rules.append("INSEE Registre national")
+
+            if _missing_critical:
+                st.warning(
+                    f"⚠️ **Colonnes critiques non mappées** : {', '.join(_missing_critical)}. "
+                    f"Mappez-les ci-dessus pour activer plus de règles. "
+                    f"Seules **{len(_applicable_rules)}** règle(s) sont applicables avec le mapping actuel."
+                )
+
+            if not _applicable_rules:
+                st.error("Aucune colonne mappée ne correspond à une règle de contrôle. Ajustez le mapping ci-dessus.")
+            else:
+                st.info(f"**Règles applicables** : {' · '.join(_applicable_rules)}")
+            if _applicable_rules and st.button("Analyser le fichier (via Snowflake)", type="primary", key="fr_run_import"):
+                progress_bar = st.progress(0, text="Préparation de l'analyse…")
+                progress_bar.progress(5, text="Calcul du score initial…")
+                score_before = _quick_score(df_raw, mapping)
+                progress_bar.progress(10, text="Dédoublonnage…")
+                df_clean, df_removed, dedup_stats = (
+                    deduplicate_dataframe(df_raw, mapping, dedup_keys, dedup_strategy)
+                    if auto_dedup and dedup_keys
+                    else (df_raw.copy(), pd.DataFrame(), {})
+                )
+                progress_bar.progress(20, text=f"Analyse de {len(df_clean)} lignes (règles DQ + INSEE)…")
+                anomalies, stats = analyze_uploaded_dataframe(
+                    df_clean, mapping, source="import",
+                    enabled_rules=enabled_rules, skip_duplicate_check=auto_dedup,
+                    custom_rules=custom_rules, skip_name_search=True,
+                )
+                progress_bar.progress(80, text="Sauvegarde sur Snowflake…")
+                stats["dedup"] = dedup_stats
+                stats["score_before"] = score_before
+                stats["engine"] = "snowflake"
+                stats["active_rules"] = enabled_rules
+                _target_tbl = st.session_state.get("import_target_table", STAGING_TABLE)
+                stage_dataframe_to_snowflake(df_clean, _target_tbl)
+                st.session_state["import_wizard_table"] = _target_tbl
+                progress_bar.progress(100, text="Terminé !")
+                st.session_state["fr_clean_df"] = df_clean
+                st.session_state["fr_removed_df"] = df_removed
+                _store_analysis_results(anomalies, stats, uploaded.name, "import")
+                add_audit_entry("Import fichier analysé", f"{uploaded.name} · {stats['anomaly_count']} anomalies · snowflake")
+                st.toast(f"{stats['anomaly_count']} anomalie(s) détectée(s)")
+                # Store deferred enrichment for name search
+                st.session_state["_deferred_import_enrichment"] = {
+                    "df": df_clean, "mapping": mapping,
+                    "enabled_rules": enabled_rules, "custom_rules": custom_rules,
+                }
+                st.rerun()
+
+    if st.session_state.get("fr_upload_stats"):
+        _render_import_results()
+
+
+def _render_import_results():
+    # --- Deferred name enrichment (runs once after fast analysis) ---
+    _deferred = st.session_state.pop("_deferred_import_enrichment", None)
+    if _deferred:
+        with st.spinner("Enrichissement INSEE par nom d'entreprise..."):
+            try:
+                _extra, _ = analyze_uploaded_dataframe(
+                    _deferred["df"], _deferred["mapping"], source="import",
+                    enabled_rules=_deferred["enabled_rules"], skip_duplicate_check=True,
+                    custom_rules=_deferred.get("custom_rules", []), skip_name_search=False,
+                )
+                _existing_ids = {a["id"] for a in st.session_state.get("fr_upload_anomalies", [])}
+                _new = [a for a in _extra if a["id"] not in _existing_ids]
+                if _new:
+                    st.session_state["fr_upload_anomalies"] = st.session_state.get("fr_upload_anomalies", []) + _new
+                    st.session_state["fr_upload_stats"]["anomaly_count"] = st.session_state["fr_upload_stats"].get("anomaly_count", 0) + len(_new)
+                    st.toast(f"+{len(_new)} anomalie(s) enrichie(s) via nom INSEE")
+            except Exception:
+                pass
+
+    stats = st.session_state.get("fr_upload_stats", {})
+    anomalies = st.session_state.get("fr_upload_anomalies", [])
+    fname = st.session_state.get("fr_upload_filename", "fichier")
+    df_clean = st.session_state.get("fr_clean_df", pd.DataFrame())
+    df_removed = st.session_state.get("fr_removed_df", pd.DataFrame())
+
+    st.markdown("---")
+    st.markdown(f"##### Résultats · `{html.escape(fname)}`")
+    engine_label = stats.get("engine", "snowflake")
+    source_label = "Table Snowflake" if st.session_state.get("fr_data_source") == "snowflake" else "Fichier importé"
+    st.markdown(
+        '<div class="qx-kpi-grid">'
+        + kpi_card("Lignes analysées", str(stats.get("total_rows", 0)), f"{source_label} · {engine_label}", "neutral")
+        + kpi_card("Anomalies", str(stats.get("anomaly_count", 0)), f"{stats.get('affected_rows', 0)} lignes impactées", "down")
+        + kpi_card("Score conformité", f"{stats.get('score', 0)}%", f"Avant: {stats.get('score_before', '—')}%", "neutral")
+        + kpi_card("E-facturation prête", str(stats.get("einvoicing_ready", 0)), "SIREN+SIRET valides", "neutral")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    _render_cleaning_preview(stats, df_clean, df_removed)
+
+    if not anomalies:
+        st.success("Aucune anomalie détectée sur ce fichier.")
+        return
+
+    rule_filter = st.multiselect(
+        "Filtrer par règle",
+        sorted({a["rule_id"] for a in anomalies}),
+        default=sorted({a["rule_id"] for a in anomalies}),
+        key="fr_import_rule_filter",
+    )
+    sev_filter = st.multiselect(
+        "Filtrer par sévérité",
+        ["HIGH", "MEDIUM", "LOW"],
+        default=["HIGH", "MEDIUM", "LOW"],
+        key="fr_import_sev_filter",
+    )
+    filtered = [
+        a for a in anomalies
+        if a["rule_id"] in rule_filter and a["severity"] in sev_filter
+    ]
+    st.markdown(f"**{len(filtered)}** anomalie(s) affichée(s)")
+
+    # --- Table style like page Anomalies ---
+    t = get_theme()
+    accent = t['accent']
+    # Rules legend
+    # --- 1-click bulk resolve ALL open anomalies ---
+    _open_anomalies = [f for f in findings if f.get("status") in ("Open", "In Review")]
+    if _open_anomalies:
+        _btn_col1, _btn_col2 = st.columns([1, 2])
+        with _btn_col1:
+            if st.button(
+                f"Tout corriger et résoudre ({len(_open_anomalies)})",
+                type="primary",
+                key="bulk_resolve_all",
+                use_container_width=True,
+            ):
+                _resolved = 0
+                _all_anomalies_map = {a["id"]: a for a in get_all_fr_anomalies()}
+                for f in _open_anomalies:
+                    fid = f["id"]
+                    corr = _auto_correct_finding(f)
+                    corrected_value = ""
+                    if corr:
+                        # Extract the corrected value (before the confidence note)
+                        corrected_value = corr.split(" (confiance")[0].strip() if "(confiance" in corr else corr
+                    fr_resolve_anomaly(fid, "Accepted", corrected_value=corrected_value)
+                    _resolved += 1
+                add_audit_entry("Correction groupée", f"{_resolved} anomalies résolues en 1 clic")
+                load_dq_findings.clear()
+                st.toast(f"{_resolved} anomalie(s) corrigée(s) et résolue(s)")
+                st.rerun()
+        with _btn_col2:
+            st.caption(f"Résout toutes les anomalies ouvertes en appliquant les corrections INSEE quand disponibles.")
+
+    _rule_descriptions = {
+        "R01": ("Format SIREN", "9 chiffres valides", "#ef4444"),
+        "R02": ("Format SIRET", "14 chiffres valides", "#ef4444"),
+        "R03": ("Cohérence SIRET", "SIRET = SIREN + NIC", "#f59e0b"),
+        "R04": ("TVA intracommunautaire", "FR + 11 chiffres (Luhn)", "#f59e0b"),
+        "R05": ("Pays FR", "Code pays = FR", "#3b82f6"),
+        "R06": ("Code NAF/APE", "Format XX.XXZ", "#3b82f6"),
+        "INSEE": ("Validation INSEE", "Registre SIRENE 29M+", "#f59e0b"),
+        "DUP": ("Doublon", "SIREN en double", "#ef4444"),
+    }
+    _active_import_rules = sorted({a["rule_id"] for a in filtered})
+    _legend = ""
+    for _rid in _active_import_rules:
+        _info = _rule_descriptions.get(_rid)
+        if _info:
+            _rname, _rdesc, _rc = _info
+            _legend += (
+                f'<div style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;margin-bottom:4px;cursor:help;" title="{_rid} — {_rdesc}">'
+                f'<span style="font-size:0.65rem;padding:2px 7px;border-radius:4px;background:{_rc};color:#fff;font-weight:700;">{_rid}</span>'
+                f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{_rname}</span>'
+                f'</div>'
+            )
+    if _legend:
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:8px;padding:10px 14px;margin-bottom:10px;">'
+            f'<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:{t["text_secondary"]};font-weight:600;margin-bottom:4px;">Règles · Survoler pour détails</div>'
+            f'<div style="display:flex;flex-wrap:wrap;align-items:center;">{_legend}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    select_all_import = st.checkbox("Tout sélectionner", value=False, key="fr_import_select_all")
+
+    table_data = []
+    for a in filtered[:50]:
+        table_data.append({
+            "Sélectionner": select_all_import,
+            "Entreprise": a.get("company_name", ""),
+            "Anomalie": a.get("finding_type", ""),
+            "Champ": a.get("field_label", ""),
+            "Valeur": str(a.get("field_value", "") or "—"),
+            "Attendu": str(a.get("expected_value", "") or "—"),
+            "Sévérité": a.get("severity", ""),
+            "Règle": a.get("rule_id", ""),
+        })
+
+    if table_data:
+        df_table = pd.DataFrame(table_data)
+        edited_df = st.data_editor(
+            df_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Sélectionner": st.column_config.CheckboxColumn("✓", width="small"),
+                "Entreprise": st.column_config.TextColumn("Entreprise", width="medium"),
+                "Anomalie": st.column_config.TextColumn("Anomalie", width="medium"),
+                "Champ": st.column_config.TextColumn("Champ", width="small"),
+                "Valeur": st.column_config.TextColumn("Valeur fichier", width="medium"),
+                "Attendu": st.column_config.TextColumn("Attendu", width="medium"),
+                "Sévérité": st.column_config.SelectboxColumn("Sévérité", options=["HIGH", "MEDIUM", "LOW"], width="small"),
+                "Règle": st.column_config.TextColumn("Règle", width="small"),
+            },
+            key="fr_import_editor",
+            num_rows="fixed",
+        )
+
+    # Export CSV
+    export_df = pd.DataFrame([{
+        "Ligne": a.get("row_num", ""),
+        "ID": a.get("id", ""),
+        "Compte": a.get("account_id", ""),
+        "Raison sociale": a.get("company_name", ""),
+        "Règle": a["rule_id"],
+        "Sévérité": TR_SEVERITY.get(a["severity"], a["severity"]),
+        "Champ": a.get("field_label", ""),
+        "Valeur fichier": a.get("field_value", ""),
+        "Valeur attendue": a.get("expected_value", ""),
+        "Type": a.get("finding_type", ""),
+    } for a in filtered])
+    st.download_button(
+        "Exporter les anomalies (CSV)",
+        export_df.to_csv(index=False, sep=";"),
+        file_name="anomalies_import.csv",
+        mime="text/csv",
+        key="fr_dl_import_anomalies",
+    )
+
+    with st.expander("Détail des anomalies"):
+        for a in filtered[:50]:
+            card(
+                f'{severity_badge(a["severity"])} '
+                f'<span class="qx-badge" style="background:var(--accent-soft);color:var(--accent);">{html.escape(a["rule_id"])}</span> '
+                f'<strong>Ligne {a["row_num"]}</strong> · {html.escape(a["company_name"])}<br>'
+                f'<span style="color:var(--text-secondary);">{html.escape(a["finding_type"])}</span><br>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;font-size:0.85rem;">'
+                f'<div><span style="color:var(--text-secondary);">Fichier · </span>{html.escape(a["field_value"]) or "—"}</div>'
+                f'<div><span style="color:var(--text-secondary);">Attendu · </span>{html.escape(a["expected_value"])}</div>'
+                f'</div>'
+            )
+
+    if st.button("Envoyer vers le centre de résolution", key="fr_push_resolution"):
+        merged = {a["id"]: a for a in get_fr_anomalies()}
+        for a in anomalies:
+            merged[a["id"]] = {
+                "id": a["id"],
+                "account_id": a["account_id"],
+                "company_name": a["company_name"],
+                "field": a["field"],
+                "field_label": a["field_label"],
+                "field_value": a["field_value"],
+                "expected_value": a["expected_value"],
+                "rule_id": a["rule_id"],
+                "status": "Open",
+                "source": "import",
+            }
+        st.session_state["fr_anomalies"] = list(merged.values())
+        st.toast(f"{len(anomalies)} anomalie(s) ajoutée(s) au centre de résolution")
+        st.rerun()
+
+    st.success(
+        "Validation INSEE SIRENE **active** · Registre national 29M+ entreprises (Marketplace Snowflake)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+
+def render_sidebar():
+    t = get_theme()
+    findings = get_findings()
+    open_findings = sum(1 for f in findings if f["status"] == "Open")
+    open_tasks = sum(1 for f in findings if f["status"] in ("Open", "In Review"))
+    _fr_anomalies = get_all_fr_anomalies()
+    fr_count = len(_fr_anomalies)
+
+    with st.sidebar:
+        # --- Logo ---
+        st.markdown(f'''
+        <div style="padding:20px 16px 16px;">
+            <div style="display:flex;align-items:center;gap:12px;">
+                <div style="width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,#0E9C8A,#1BD1B4);
+                    display:flex;align-items:center;justify-content:center;
+                    box-shadow:0 4px 12px -4px rgba(14,156,138,0.5);">
+                    <svg viewBox="0 0 64 64" width="28" height="28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="32" cy="38" r="18" stroke="#fff" stroke-width="2.5"/>
+                        <path d="M22 56c0-6 4.5-10 10-10s10 4 10 10" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+                        <ellipse cx="32" cy="24" rx="14" ry="4" stroke="#fff" stroke-width="2.5"/>
+                        <path d="M18 24c0-8 6-14 14-14s14 6 14 14" stroke="#fff" stroke-width="2.5"/>
+                        <circle cx="32" cy="14" r="4" stroke="#fff" stroke-width="2.5"/>
+                        <circle cx="26" cy="36" r="5" stroke="#fff" stroke-width="2.2"/>
+                        <circle cx="38" cy="36" r="5" stroke="#fff" stroke-width="2.2"/>
+                        <line x1="31" y1="36" x2="33" y2="36" stroke="#fff" stroke-width="2"/>
+                        <path d="M28 44c2 2 4 2 6 0" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
+                        <path d="M36 33l2 4" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+                        <path d="M54 20l2-6 2 6-6 2 6 2-2 6-2-6 6-2z" fill="#fff"/>
+                    </svg>
+                </div>
+                <div>
+                    <div style="font-size:1.15rem;font-weight:700;color:{t["text_primary"]};">L\u00e9on</div>
+                    <div style="font-size:0.62rem;letter-spacing:0.18em;color:{t["accent"]};text-transform:uppercase;font-weight:600;">Data Quality</div>
+                </div>
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+
+        current_page = st.session_state.get("page", "dashboard")
+
+        # --- CTA: Lancer l'analyse ---
+        if st.button("Lancer l'analyse", key="nav_run_analysis_cta", use_container_width=True,
+                     type="primary"):
+            st.session_state["page"] = "run_analysis"
+            st.rerun()
+
+        # --- Navigation: PRINCIPAL ---
+        st.markdown(f'<div style="font-size:0.62rem;font-weight:700;letter-spacing:0.12em;color:{t["text_secondary"]};padding:18px 16px 10px;">PRINCIPAL</div>', unsafe_allow_html=True)
+
+        nav_main = [
+            ("dashboard", "Tableau de bord"),
+            ("customer_data", "Donn\u00e9es clients"),
+            ("rule_catalog", "Catalogue de r\u00e8gles"),
+        ]
+        for page_id, label in nav_main:
+            if st.button(label, key=f"nav_{page_id}", use_container_width=True,
+                         type="primary" if current_page == page_id else "secondary"):
+                st.session_state["page"] = page_id
+                st.rerun()
+
+        # --- Navigation: RESULTATS ---
+        st.markdown(f'<div style="font-size:0.62rem;font-weight:700;letter-spacing:0.12em;color:{t["text_secondary"]};padding:18px 16px 10px;">R\u00c9SULTATS</div>', unsafe_allow_html=True)
+
+        _hist_count = len(load_analysis_history())
+
+        _results_nav = [
+            ("history", "Historique", _hist_count),
+            ("findings", "Anomalies", open_findings),
+            ("tasks", "T\u00e2ches", open_tasks),
+        ]
+        for page_id, label, badge in _results_nav:
+            _btn_text = f"{label}   {badge}" if badge > 0 else label
+            if st.button(_btn_text, key=f"nav_{page_id}", use_container_width=True,
+                         type="primary" if current_page == page_id else "secondary"):
+                st.session_state["page"] = page_id
+                st.rerun()
+
+        # --- Navigation: OUTILS ---
+        st.markdown(f'<div style="font-size:0.62rem;font-weight:700;letter-spacing:0.12em;color:{t["text_secondary"]};padding:18px 16px 10px;">OUTILS</div>', unsafe_allow_html=True)
+
+        if st.button("Exports", key="nav_exports", use_container_width=True,
+                     type="primary" if current_page == "exports" else "secondary"):
+            st.session_state["page"] = "exports"
+            st.rerun()
+
+        # --- Bottom: Snowflake status card ---
+        _src_mode = st.session_state.get("source_mode", "snowflake")
+        _src_label = st.session_state.get("uploaded_filename", "") if _src_mode == "file" else "Snowflake"
+        _sync_label = "sync 2 min" if _src_mode != "file" else "fichier local"
+        st.markdown(f'''
+        <div style="margin-top:24px;padding:14px 14px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);border-radius:12px;
+            display:flex;align-items:center;gap:12px;">
+            <div style="width:12px;height:12px;border-radius:50%;background:#16A34A;box-shadow:0 0 0 3px rgba(22,163,74,0.2);flex-shrink:0;"></div>
+            <div>
+                <div style="font-size:0.85rem;font-weight:700;color:#e2e8f0;">{html.escape(_src_label)}</div>
+                <div style="font-size:0.7rem;color:#94a3b8;">Source connect\u00e9e \u00b7 {_sync_label}</div>
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
+
+def page_dashboard():
+    t = get_theme()
+    accent = t["accent"]
+
+    # --- Archived analysis viewing mode ---
+    _archived_id = st.session_state.get("viewing_archived_id")
+    if _archived_id:
+        _archived = load_history_entry(_archived_id)
+        if _archived:
+            _arch_source = _archived.get("source_table", "")
+            _arch_date = _archived.get("created_at")
+            _arch_date_str = _arch_date.strftime("%d %b. %Y · %H:%M") if _arch_date else ""
+            _arch_rows = _archived.get("total_rows", 0)
+            _arch_score = _archived.get("score", 0)
+            _arch_anomalies = _archived.get("anomaly_count", 0)
+            _arch_dups = _archived.get("duplicates_count", 0)
+            _arch_clean = _archived.get("clean_rows", 0)
+            _arch_source_short = _arch_source.split(".")[-1] if "." in _arch_source else _arch_source
+
+            # Dark banner
+            st.markdown(
+                f'<div style="background:linear-gradient(135deg,#1e293b,#0f172a);border-radius:16px;padding:20px 28px;margin-bottom:20px;'
+                f'border:1px solid #334155;">'
+                f'<div style="display:flex;align-items:center;justify-content:space-between;">'
+                f'<div style="display:flex;align-items:center;gap:14px;">'
+                f'<div style="width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:center;">'
+                f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></div>'
+                f'<div>'
+                f'<div style="display:flex;align-items:center;gap:10px;">'
+                f'<span style="font-size:0.88rem;font-weight:700;color:#f1f5f9;">Vous consultez une analyse archivée</span>'
+                f'<span style="font-size:0.6rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;'
+                f'padding:3px 8px;border-radius:4px;background:rgba(250,204,21,0.15);color:#fbbf24;">Lecture seule</span>'
+                f'</div>'
+                f'<div style="font-size:0.75rem;color:#94a3b8;margin-top:3px;">'
+                f'{_arch_source_short} · analysée le {_arch_date_str} · {_arch_rows} lignes</div>'
+                f'</div></div></div></div>',
+                unsafe_allow_html=True,
+            )
+
+            # Action buttons
+            ab1, ab2, ab3 = st.columns([1.5, 1.5, 3])
+            with ab1:
+                if st.button("Relancer cette source", key="arch_relaunch", type="primary", use_container_width=True, icon=":material/refresh:"):
+                    st.session_state.pop("viewing_archived_id", None)
+                    st.session_state["page"] = "run_analysis"
+                    st.rerun()
+            with ab2:
+                if st.button("Revenir à l'actuelle", key="arch_back", use_container_width=True, icon=":material/arrow_back:"):
+                    st.session_state.pop("viewing_archived_id", None)
+                    st.rerun()
+
+            # --- Full archived dashboard ---
+            st.markdown(f'''
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-top:20px;margin-bottom:28px;">
+                <div>
+                    <h1 style="font-size:1.75rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px 0;letter-spacing:-0.02em;">Tableau de bord</h1>
+                    <p style="font-size:0.88rem;color:{t["text_secondary"]};margin:0;">Résultats de l'analyse archivée du {_arch_date.strftime("%d %B %Y") if _arch_date else ""}.</p>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;padding:7px 14px;background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:10px;font-size:0.78rem;color:{t["text_secondary"]};font-weight:500;">
+                    <span style="width:8px;height:8px;border-radius:50%;background:{accent};"></span>
+                    {_arch_source_short} · {_arch_date.strftime("%d %b.") if _arch_date else ""}
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
+            # Load findings for this archived source to build detailed sections
+            _arch_findings = []
+            try:
+                _arch_src_escaped = _arch_source.replace("'", "''")
+                _arch_findings_df = _sf_query(
+                    f"SELECT * FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS "
+                    f"WHERE source_table = '{_arch_src_escaped}' "
+                    f"ORDER BY created_at DESC"
+                )
+                if not _arch_findings_df.empty:
+                    _arch_findings_df.columns = [c.lower() for c in _arch_findings_df.columns]
+                    _arch_findings = _arch_findings_df.to_dict("records")
+            except Exception:
+                pass
+
+            _arch_open = sum(1 for f in _arch_findings if f.get("status") == "Open")
+            _arch_review = sum(1 for f in _arch_findings if f.get("status") == "In Review")
+            _arch_resolved = sum(1 for f in _arch_findings if f.get("status") == "Resolved")
+            _arch_dismissed = sum(1 for f in _arch_findings if f.get("status") == "Dismissed")
+            _arch_high = sum(1 for f in _arch_findings if f.get("severity") == "HIGH")
+            _arch_med = sum(1 for f in _arch_findings if f.get("severity") == "MEDIUM")
+            _arch_low = sum(1 for f in _arch_findings if f.get("severity") == "LOW")
+            _arch_open_tasks = _arch_open + _arch_review
+            _arch_score_diff = _arch_score - 80
+            _arch_sc_color = "#0d9488" if _arch_score_diff >= 0 else "#dc2626"
+            _arch_sc_text = f"{abs(_arch_score_diff)} pts"
+            _arch_sc_context = f"au-dessus de 80 %" if _arch_score_diff >= 0 else f"sous l'objectif de 80 %"
+            _arch_prev_score = _archived.get("score_previous")
+            _arch_delta = (_arch_score - _arch_prev_score) if _arch_prev_score is not None else 0
+            _arch_delta_color = "#0d9488" if _arch_delta >= 0 else "#dc2626"
+
+            # ROW 1 — 4 rich KPI cards
+            st.markdown(f"""
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;">
+                <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid {_arch_sc_color};border-radius:14px;padding:22px 22px 18px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Score de conformité</div>
+                        <div style="width:32px;height:32px;border-radius:8px;background:rgba(22,163,74,0.1);display:flex;align-items:center;justify-content:center;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                        </div>
+                    </div>
+                    <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_arch_score}<span style="font-size:1.2rem;font-weight:600;">%</span></div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                        <span style="background:{_arch_sc_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:0.65rem;font-weight:700;">
+                            {'↓' if _arch_score_diff < 0 else '↑'} {_arch_sc_text}</span>
+                        <span style="font-size:0.7rem;color:{t['text_secondary']};">{_arch_sc_context}</span>
+                    </div>
+                </div>
+                <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #eab308;border-radius:14px;padding:22px 22px 18px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Anomalies</div>
+                        <div style="width:32px;height:32px;border-radius:8px;background:rgba(234,179,8,0.1);display:flex;align-items:center;justify-content:center;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#eab308" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                        </div>
+                    </div>
+                    <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_arch_anomalies}</div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                        <span style="font-size:0.7rem;color:{t['high']};font-weight:600;">{_arch_high} critiques</span>
+                        <span style="font-size:0.7rem;color:{t['text_secondary']};">à traiter</span>
+                    </div>
+                </div>
+                <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #2563eb;border-radius:14px;padding:22px 22px 18px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Tâches ouvertes</div>
+                        <div style="width:32px;height:32px;border-radius:8px;background:rgba(2,132,199,0.1);display:flex;align-items:center;justify-content:center;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#14b8a6" stroke-width="2.5"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                        </div>
+                    </div>
+                    <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_arch_open_tasks}</div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                        <span style="background:{t['card_bg']};border:1px solid {t['border']};color:{t['text_primary']};padding:2px 8px;border-radius:6px;font-size:0.65rem;font-weight:600;">
+                            {_arch_review} en revue</span>
+                        <span style="font-size:0.7rem;color:{t['text_secondary']};">{_arch_resolved} résolues</span>
+                    </div>
+                </div>
+                <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #0d9488;border-radius:14px;padding:22px 22px 18px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                        <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Lignes analysées</div>
+                        <div style="width:32px;height:32px;border-radius:8px;background:rgba(22,163,74,0.1);display:flex;align-items:center;justify-content:center;">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        </div>
+                    </div>
+                    <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_arch_rows}</div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                        <span style="font-size:0.7rem;color:{t['text_secondary']};">{_arch_clean} après nettoyage</span>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ROW 2 — Conformité ring
+            _arch_ring_color = "#0d9488" if _arch_score >= 70 else ("#eab308" if _arch_score >= 40 else "#dc2626")
+            _arch_ring_status = "Conforme" if _arch_score >= 80 else "À surveiller" if _arch_score >= 50 else "Critique"
+            _arch_ring_sc = _arch_ring_color
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:24px 22px;text-align:center;max-width:340px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:20px;justify-content:flex-start;">'
+                f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Conformité globale</span></div>'
+                f'<div style="position:relative;width:180px;height:180px;margin:0 auto;">'
+                f'<svg viewBox="0 0 36 36" style="width:180px;height:180px;transform:rotate(-90deg);">'
+                f'<path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="{t["border_subtle"]}" stroke-width="3"/>'
+                f'<path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="{_arch_ring_color}" stroke-width="3" stroke-dasharray="{_arch_score}, 100" stroke-linecap="round"/>'
+                f'</svg>'
+                f'<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;">'
+                f'<div style="font-size:2.2rem;font-weight:800;color:{t["text_primary"]};line-height:1;">{_arch_score}%</div>'
+                f'<div style="font-size:0.65rem;font-weight:600;color:{t["text_secondary"]};text-transform:uppercase;letter-spacing:0.1em;margin-top:4px;">Conformité</div>'
+                f'</div></div>'
+                f'<div style="margin-top:16px;display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;'
+                f'background:rgba({",".join(str(int(_arch_ring_sc[i:i+2], 16)) for i in (1,3,5))},0.1);'
+                f'font-size:0.72rem;font-weight:600;color:{_arch_ring_sc};">⊘ {_arch_ring_status}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ROW 3 — Severity + Status (if findings available)
+            if _arch_findings:
+                _col_sev, _col_status = st.columns(2)
+                _arch_total_f = len(_arch_findings) or 1
+                _arch_high_pct = round(_arch_high / _arch_total_f * 100)
+                _arch_med_pct = round(_arch_med / _arch_total_f * 100)
+                _arch_low_pct = round(_arch_low / _arch_total_f * 100)
+
+                with _col_sev:
+                    st.markdown(
+                        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                        f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Répartition par sévérité</span></div>'
+                        f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">{len(_arch_findings)} anomalies</span></div>'
+                        f'<div style="margin-bottom:18px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<span style="width:10px;height:10px;border-radius:50%;background:#ef4444;"></span>'
+                        f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Élevée</span></div>'
+                        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{_arch_high}</span></div>'
+                        f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+                        f'<div style="height:100%;width:{max(_arch_high_pct,2)}%;border-radius:4px;background:#ef4444;"></div></div></div>'
+                        f'<div style="margin-bottom:18px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<span style="width:10px;height:10px;border-radius:50%;background:#f59e0b;"></span>'
+                        f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Moyenne</span></div>'
+                        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{_arch_med}</span></div>'
+                        f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+                        f'<div style="height:100%;width:{max(_arch_med_pct,2)}%;border-radius:4px;background:#f59e0b;"></div></div></div>'
+                        f'<div>'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<span style="width:10px;height:10px;border-radius:50%;background:#14b8a6;"></span>'
+                        f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Faible</span></div>'
+                        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{_arch_low}</span></div>'
+                        f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+                        f'<div style="height:100%;width:{max(_arch_low_pct,2)}%;border-radius:4px;background:#14b8a6;"></div></div></div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                with _col_status:
+                    st.markdown(
+                        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                        f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Statuts de traitement</span></div>'
+                        f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">Sujet : conformité</span></div>'
+                        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">'
+                        f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+                        f'<div style="font-size:1.8rem;font-weight:800;color:#2563eb;line-height:1;">{_arch_open}</div>'
+                        f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+                        f'<span style="width:7px;height:7px;border-radius:50%;background:#2563eb;"></span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Ouvert</span></div></div>'
+                        f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+                        f'<div style="font-size:1.8rem;font-weight:800;color:#f59e0b;line-height:1;">{_arch_review}</div>'
+                        f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+                        f'<span style="width:7px;height:7px;border-radius:50%;background:#f59e0b;"></span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">En revue</span></div></div>'
+                        f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+                        f'<div style="font-size:1.8rem;font-weight:800;color:#0d9488;line-height:1;">{_arch_resolved}</div>'
+                        f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+                        f'<span style="width:7px;height:7px;border-radius:50%;background:#0d9488;"></span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Résolu</span></div></div>'
+                        f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+                        f'<div style="font-size:1.8rem;font-weight:800;color:#94a3b8;line-height:1;">{_arch_dismissed}</div>'
+                        f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+                        f'<span style="width:7px;height:7px;border-radius:50%;background:#94a3b8;"></span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Rejeté</span></div></div>'
+                        f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ROW 4 — Recent anomalies list
+                _arch_recent = _arch_findings[:6]
+                _arch_rows_html = ""
+                for f in _arch_recent:
+                    name = f.get("company_name", "?")
+                    initial = name[0].upper() if name else "?"
+                    sev = f.get("severity", "LOW")
+                    if sev == "HIGH":
+                        av_bg, badge_text, badge_bg, badge_color = "#dc2626", "CRITIQUE", "rgba(220,38,38,0.1)", "#dc2626"
+                    elif sev == "MEDIUM":
+                        av_bg, badge_text, badge_bg, badge_color = "#f59e0b", "MOYENNE", "rgba(245,158,11,0.1)", "#92400e"
+                    else:
+                        av_bg, badge_text, badge_bg, badge_color = "#3b82f6", "FAIBLE", "rgba(59,130,246,0.1)", "#1d4ed8"
+                    _arch_rows_html += (
+                        f'<div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid {t["border_subtle"]};">'
+                        f'<div style="width:36px;height:36px;border-radius:50%;background:{av_bg};display:flex;align-items:center;'
+                        f'justify-content:center;color:#fff;font-weight:700;font-size:0.82rem;flex-shrink:0;">{initial}</div>'
+                        f'<div style="flex:1;min-width:0;">'
+                        f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{html.escape(name)}</div>'
+                        f'<div style="display:flex;align-items:center;gap:6px;margin-top:3px;">'
+                        f'<span style="background:{badge_bg};color:{badge_color};padding:1px 7px;border-radius:4px;font-size:0.6rem;font-weight:700;">{badge_text}</span>'
+                        f'<span style="font-size:0.7rem;color:{t["text_secondary"]};">{html.escape(f.get("finding_type", ""))}</span></div>'
+                        f'</div>'
+                        f'<div style="font-size:0.68rem;color:{t["text_secondary"]};white-space:nowrap;">{html.escape(str(f.get("rule_id", ""))[:8])}</div>'
+                        f'</div>'
+                    )
+                st.markdown(
+                    f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;margin-top:16px;">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">'
+                    f'<div style="display:flex;align-items:center;gap:8px;">'
+                    f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                    f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Dernières anomalies</span></div>'
+                    f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">{len(_arch_findings)} au total</span></div>'
+                    f'{_arch_rows_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ROW 5 — Top impacted accounts
+                _arch_acct_hits: dict = {}
+                for f in _arch_findings:
+                    _aid = f.get("account_id", "")
+                    _arch_acct_hits[_aid] = _arch_acct_hits.get(_aid, {"name": f.get("company_name", "?"), "count": 0})
+                    _arch_acct_hits[_aid]["count"] += 1
+                _arch_top_accts = sorted(_arch_acct_hits.values(), key=lambda x: x["count"], reverse=True)[:8]
+                if _arch_top_accts:
+                    _arch_acct_cards = ""
+                    for acc in _arch_top_accts:
+                        name = acc["name"]
+                        initials = "".join(w[0] for w in name.split()[:2]).upper() if name else "?"
+                        _arch_acct_cards += (
+                            f'<div style="display:flex;align-items:center;gap:12px;padding:14px 18px;'
+                            f'background:{t["border_subtle"]};border-radius:12px;min-width:200px;flex-shrink:0;">'
+                            f'<div style="width:40px;height:40px;border-radius:50%;background:#1e293b;display:flex;align-items:center;'
+                            f'justify-content:center;color:#fff;font-weight:700;font-size:0.74rem;flex-shrink:0;">{initials}</div>'
+                            f'<div style="flex:1;min-width:0;">'
+                            f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{html.escape(name)}</div>'
+                            f'<div style="font-size:0.68rem;color:{t["text_secondary"]};">Client</div></div>'
+                            f'<div style="width:30px;height:30px;border-radius:50%;background:rgba(220,38,38,0.08);display:flex;align-items:center;'
+                            f'justify-content:center;font-size:0.76rem;font-weight:700;color:#e11d48;flex-shrink:0;">{acc["count"]}</div>'
+                            f'</div>'
+                        )
+                    st.markdown(
+                        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;margin-top:16px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                        f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Comptes les plus impactés</span></div>'
+                        f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">nombre d\'anomalies</span></div>'
+                        f'<div style="display:flex;gap:12px;overflow-x:auto;padding-bottom:4px;">{_arch_acct_cards}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            return  # End of archived view
+
+    # Load findings — use session anomalies from current analysis only
+    if st.session_state.get("fr_scan_done", False):
+        # Current analysis results are in fr_upload_anomalies
+        findings = st.session_state.get("fr_upload_anomalies", [])
+        if not findings:
+            findings = st.session_state.get("findings", [])
+    elif st.session_state.get("source_mode") == "file":
+        findings = st.session_state.get("findings", [])
+        _upload_anoms = st.session_state.get("fr_upload_anomalies", [])
+        if _upload_anoms:
+            _seen = {f.get("id") for f in findings}
+            for a in _upload_anoms:
+                if a.get("id") not in _seen:
+                    findings.append(a)
+    else:
+        # No analysis run yet — empty dashboard (onboarding)
+        findings = []
+
+    # --- Data preparation ---
+    _df_active, _source_label = _get_active_data()
+    _accounts = _df_active.to_dict("records") if not _df_active.empty else []
+
+    records = len(_accounts) or 1
+    _ws = st.session_state.get("wizard_stats", {})
+
+    # All findings are from the current analysis — no cross-source filtering needed
+    _relevant_findings = findings
+
+    # Determine if analysis was ever run
+    _analysis_done = bool(_ws) or bool(_relevant_findings) or st.session_state.get("fr_scan_done", False)
+
+    # --- Empty state: show onboarding screen if no analysis has been done ---
+    if not _analysis_done:
+        accent = t["accent"]
+        _sf_account = st.session_state.get("sf_account", "SFSEEUROPE-TEST_DEMO_ACCOUNT_AS")
+        _sf_wh = st.session_state.get("sf_warehouse", "COMPUTE_WH")
+        st.markdown(
+            f'<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px 30px;">'
+            # Clipboard icon
+            f'<div style="width:90px;height:90px;margin-bottom:20px;position:relative;">'
+            f'<svg width="90" height="90" viewBox="0 0 90 90" fill="none">'
+            f'<rect x="20" y="15" width="50" height="60" rx="8" stroke="{accent}" stroke-width="2.5" fill="{t["card_bg"]}"/>'
+            f'<rect x="30" y="8" width="30" height="14" rx="4" stroke="{accent}" stroke-width="2" fill="{t["card_bg"]}"/>'
+            f'<line x1="32" y1="35" x2="58" y2="35" stroke="{t["border"]}" stroke-width="2"/>'
+            f'<line x1="32" y1="45" x2="58" y2="45" stroke="{t["border"]}" stroke-width="2"/>'
+            f'<line x1="32" y1="55" x2="50" y2="55" stroke="{t["border"]}" stroke-width="2"/>'
+            f'<circle cx="65" cy="60" r="14" fill="{accent}" stroke="none"/>'
+            f'<line x1="65" y1="53" x2="65" y2="67" stroke="#fff" stroke-width="2.5"/>'
+            f'<line x1="58" y1="60" x2="72" y2="60" stroke="#fff" stroke-width="2.5"/>'
+            f'</svg></div>'
+            # Status badge
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:14px;">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:#10b981;"></span>'
+            f'<span style="font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:{t["text_secondary"]};">Aucune analyse pour l\'instant</span></div>'
+            # Heading
+            f'<div style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin-bottom:10px;text-align:center;">Prêt à contrôler vos données ?</div>'
+            # Subtitle
+            f'<div style="font-size:0.88rem;color:{t["text_secondary"]};text-align:center;max-width:500px;margin-bottom:28px;line-height:1.6;">'
+            f'Votre source Snowflake est connectée. Lancez une première analyse pour détecter les anomalies SIREN, SIRET et TVA — le tableau de bord se remplira automatiquement avec vos résultats.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        # --- Source choice cards (Table Snowflake / Importer un fichier) ---
+        _col_card1, _col_card2 = st.columns(2)
+        with _col_card1:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:16px;padding:28px 26px;height:100%;position:relative;">'
+                # Icon
+                f'<div style="width:48px;height:48px;border-radius:12px;background:rgba(37,99,235,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:16px;">'
+                f'<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="1.8"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>'
+                # Badge RECOMMANDÉ
+                f'<span style="position:absolute;top:22px;right:22px;font-size:0.6rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;padding:4px 10px;border-radius:6px;background:rgba(13,148,136,0.1);color:#0d9488;">Recommandé</span>'
+                # Title + description
+                f'<div style="font-size:1.1rem;font-weight:800;color:{t["text_primary"]};margin-bottom:8px;">Table Snowflake</div>'
+                f'<div style="font-size:0.8rem;color:{t["text_secondary"]};line-height:1.6;margin-bottom:16px;">Analysez directement une table de votre entrepôt. Structure déjà connue, rien à configurer.</div>'
+                # Checkmarks
+                f'<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">Colonnes reconnues automatiquement</span></div>'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">Aucun upload, aucune limite de taille</span></div>'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">Données jamais copiées hors de Snowflake</span></div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Choisir une table  \u203A", key="empty_table", use_container_width=True):
+                st.session_state["page"] = "customer_data"
+                st.session_state["import_wizard_step"] = 1
+                st.session_state["import_mode"] = "table"
+                st.rerun()
+
+        with _col_card2:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:16px;padding:28px 26px;height:100%;position:relative;">'
+                # Icon
+                f'<div style="width:48px;height:48px;border-radius:12px;background:rgba(124,58,237,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:16px;">'
+                f'<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>'
+                # Title + description
+                f'<div style="font-size:1.1rem;font-weight:800;color:{t["text_primary"]};margin-bottom:8px;">Importer un fichier</div>'
+                f'<div style="font-size:0.8rem;color:{t["text_secondary"]};line-height:1.6;margin-bottom:16px;">Déposez un CSV ou Excel. Léon détecte les colonnes et vous guide pour les associer.</div>'
+                # Checkmarks
+                f'<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">CSV, TSV, XLSX, XLS · 200 Mo max</span></div>'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">Détection auto + mapping guidé</span></div>'
+                f'<div style="display:flex;align-items:center;gap:8px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg><span style="font-size:0.78rem;color:{t["text_primary"]};">Idéal pour un test ponctuel</span></div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Déposer un fichier  \u203A", key="empty_file", use_container_width=True):
+                st.session_state["page"] = "customer_data"
+                st.session_state["import_wizard_step"] = 1
+                st.session_state["import_mode"] = "file"
+                st.rerun()
+
+        # "Comment ça marche" section
+        st.markdown(
+            f'<div style="text-align:center;margin-top:30px;margin-bottom:18px;">'
+            f'<span style="font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:{t["text_secondary"]};">Comment ça marche</span></div>'
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;">'
+            # Card 1 - Ingérer
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;position:relative;">'
+            f'<div style="width:38px;height:38px;border-radius:10px;background:rgba(5,150,105,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>'
+            f'<span style="position:absolute;top:18px;right:18px;font-size:0.72rem;font-weight:600;color:{t["text_secondary"]};">01</span>'
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Ingérer</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Table Snowflake ou fichier CSV / Excel.</div></div>'
+            # Card 2 - Contrôler
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;position:relative;">'
+            f'<div style="width:38px;height:38px;border-radius:10px;background:rgba(5,150,105,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>'
+            f'<span style="position:absolute;top:18px;right:18px;font-size:0.72rem;font-weight:600;color:{t["text_secondary"]};">02</span>'
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Contrôler</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Règles R01-R08 + rapprochement INSEE.</div></div>'
+            # Card 3 - Corriger
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;position:relative;">'
+            f'<div style="width:38px;height:38px;border-radius:10px;background:rgba(5,150,105,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></div>'
+            f'<span style="position:absolute;top:18px;right:18px;font-size:0.72rem;font-weight:600;color:{t["text_secondary"]};">03</span>'
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Corriger</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Anomalies expliquées, correction assistée IA.</div></div>'
+            # Card 4 - Auditer
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;position:relative;">'
+            f'<div style="width:38px;height:38px;border-radius:10px;background:rgba(5,150,105,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="16" x2="12" y2="16"/></svg></div>'
+            f'<span style="position:absolute;top:18px;right:18px;font-size:0.72rem;font-weight:600;color:{t["text_secondary"]};">04</span>'
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Auditer</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Export CRM + piste d\'audit Snowflake.</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Connection footer
+        st.markdown(
+            f'<div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-top:30px;padding:12px 20px;border:1px solid {t["border"]};border-radius:10px;width:fit-content;margin-left:auto;margin-right:auto;">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:#10b981;"></span>'
+            f'<span style="font-size:0.78rem;color:{t["text_secondary"]};">Connecté à</span>'
+            f'<span style="font-family:monospace;font-size:0.78rem;font-weight:600;color:{t["text_primary"]};">{_sf_account}</span>'
+            f'<span style="font-size:0.78rem;color:{t["text_secondary"]};">· warehouse {_sf_wh}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    open_count = sum(1 for f in _relevant_findings if f["status"] == "Open")
+    review_count = sum(1 for f in _relevant_findings if f["status"] == "In Review")
+    resolved_count = sum(1 for f in _relevant_findings if f["status"] == "Resolved")
+    dismissed_count = sum(1 for f in _relevant_findings if f["status"] == "Dismissed")
+    open_tasks = open_count + review_count
+    high_count = sum(1 for f in _relevant_findings if f["severity"] == "HIGH")
+    med_count = sum(1 for f in _relevant_findings if f["severity"] == "MEDIUM")
+    low_count = sum(1 for f in _relevant_findings if f["severity"] == "LOW")
+
+    if _ws:
+        compliance_score = _ws.get("score", 0)
+    elif _analysis_done:
+        _affected_ids = {f["account_id"] for f in _relevant_findings if f["status"] in ("Open", "In Review")}
+        compliance_score = max(0, round((records - len(_affected_ids)) / records * 100)) if records else 0
+    else:
+        compliance_score = None  # Not yet analyzed
+    resolution_rate = round((resolved_count + dismissed_count) / len(_relevant_findings) * 100) if _relevant_findings else 0
+
+    # Delta calculation — skip expensive query if no analysis done
+    _delta = 0
+    _delta_str = "—"
+    if _relevant_findings and _analysis_done:
+        try:
+            _prev_score_df = _sf_query(f"""
+                SELECT ROUND(100.0 * (1 - COUNT(DISTINCT account_id)::FLOAT /
+                    NULLIF((SELECT COUNT(*) FROM {_table_fqn}), 0)), 0) AS prev_score
+                FROM QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS
+                WHERE status IN ('Open','In Review')
+                  AND created_at < DATEADD('day', -1, CURRENT_DATE())
+                  AND (source_table = '{_table_fqn}' OR source_table IS NULL)
+            """)
+            if not _prev_score_df.empty and _prev_score_df.iloc[0]['prev_score'] is not None:
+                _prev_score = max(0, int(_prev_score_df.iloc[0]['prev_score']))
+                _delta = (compliance_score or 0) - _prev_score
+                _delta_str = f"{_delta:+d} pts"
+        except Exception:
+            pass
+
+    # Completeness — compute from in-memory data (no extra SQL query)
+    _completeness = 0
+    if not _df_active.empty:
+        _completeness_targets = {
+            "siren", "siret", "company_name", "naf", "country", "legal_form",
+            "nom", "ville", "pays", "adresse", "n° tva", "adresse complète",
+            "vat", "city", "address", "raison_sociale", "raison sociale",
+            "nom_entreprise", "denomination", "code_postal", "cp",
+            "tva_intra", "num_tva", "forme_juridique", "code_ape",
+            "account_id", "name", "num_siren", "num_siret",
+        }
+        _check_cols = [c for c in _df_active.columns
+                       if c.lower().strip() in _completeness_targets]
+        # Fallback: if no known columns found, use ALL columns
+        if not _check_cols:
+            _check_cols = list(_df_active.columns)
+        _subset = _df_active[_check_cols]
+        _filled = _subset.apply(lambda col: col.notna() & (col.astype(str).str.strip() != ""))
+        _completeness = int(round(_filled.sum().sum() / max(1, len(_df_active) * len(_check_cols)) * 100))
+
+    # Subject/Rule data
+    subject_counts = {}
+    for f in _relevant_findings:
+        _subj = f.get("subject", "other")
+        subject_counts[_subj] = subject_counts.get(_subj, 0) + 1
+    _hits_data = load_rule_hits() if _analysis_done else []
+
+    # Show empty state if no data and no findings
+
+    # =====================================================================
+    # Dashboard Header — Title + Greeting + Date + AI Button + Avatar
+    # =====================================================================
+    _user_name = st.session_state.get("sf_user", "Snowadmin")
+    _today_fmt = _now().strftime("%d %b. %Y").lstrip("0")
+    _user_initial = _user_name[0].upper() if _user_name else "S"
+    st.markdown(f'''
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:28px;">
+        <div>
+            <h1 style="font-size:1.75rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px 0;letter-spacing:-0.02em;">Tableau de bord</h1>
+            <p style="font-size:0.88rem;color:{t["text_secondary"]};margin:0;">Bonjour <strong style="color:{t["text_primary"]};">{html.escape(_user_name)}</strong> &mdash; voici l&rsquo;\u00e9tat de sant\u00e9 de vos donn\u00e9es clients.</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;">
+            <div style="display:flex;align-items:center;gap:6px;padding:7px 14px;background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:10px;font-size:0.78rem;color:{t["text_secondary"]};font-weight:500;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="{t["text_secondary"]}" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                {_today_fmt}
+            </div>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
+    _obj = 80
+    _score_display = f"{compliance_score}" if compliance_score is not None else "—"
+    _score_suffix = '<span style="font-size:1.2rem;font-weight:600;">%</span>' if compliance_score is not None else ""
+    if compliance_score is not None:
+        _score_diff = compliance_score - _obj
+        _score_badge_color = "#dc2626" if _score_diff < 0 else "#0d9488"
+        _score_badge_text = f"{abs(_score_diff)} pts" if _score_diff != 0 else "="
+        _score_context = f"sous l'objectif de {_obj} %" if _score_diff < 0 else f"au-dessus de {_obj} %"
+    else:
+        _score_diff = 0
+        _score_badge_color = "#94a3b8"
+        _score_badge_text = "Non analysé"
+        _score_context = "Lancez une analyse"
+
+    _anom_badge_color = "#0d9488" if _delta >= 0 else "#dc2626"
+    _anom_badge_text = f"+{_delta}" if _delta > 0 else str(_delta) if _delta < 0 else "="
+
+    _incomp = max(0, records - round(records * _completeness / 100)) if _completeness else records
+
+    kpi_html = f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;">
+        <!-- Score conformité -->
+        <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid {_score_badge_color};border-radius:14px;padding:22px 22px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Score de conformité</div>
+                <div style="width:32px;height:32px;border-radius:8px;background:rgba(22,163,74,0.1);display:flex;align-items:center;justify-content:center;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                </div>
+            </div>
+            <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_score_display}{_score_suffix}</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                <span style="background:{_score_badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:0.65rem;font-weight:700;">
+                    {'↓' if _score_diff < 0 else '↑'} {_score_badge_text}</span>
+                <span style="font-size:0.7rem;color:{t['text_secondary']};">{_score_context}</span>
+            </div>
+        </div>
+        <!-- Anomalies -->
+        <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #eab308;border-radius:14px;padding:22px 22px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Anomalies</div>
+                <div style="width:32px;height:32px;border-radius:8px;background:rgba(234,179,8,0.1);display:flex;align-items:center;justify-content:center;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#eab308" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </div>
+            </div>
+            <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{len(_relevant_findings)}</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                <span style="background:{_anom_badge_color};color:#fff;padding:2px 8px;border-radius:6px;font-size:0.65rem;font-weight:700;">
+                    ↑ {_anom_badge_text}</span>
+                <span style="font-size:0.7rem;color:{t['high']};font-weight:600;">{high_count} critiques</span>
+                <span style="font-size:0.7rem;color:{t['text_secondary']};">à traiter</span>
+            </div>
+        </div>
+        <!-- Tâches ouvertes -->
+        <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #2563eb;border-radius:14px;padding:22px 22px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Tâches ouvertes</div>
+                <div style="width:32px;height:32px;border-radius:8px;background:rgba(2,132,199,0.1);display:flex;align-items:center;justify-content:center;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#14b8a6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                </div>
+            </div>
+            <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{open_tasks}</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                <span style="background:{t['card_bg']};border:1px solid {t['border']};color:{t['text_primary']};padding:2px 8px;border-radius:6px;font-size:0.65rem;font-weight:600;">
+                    {review_count} en revue</span>
+                <span style="font-size:0.7rem;color:{t['text_secondary']};">{resolved_count} résolues</span>
+            </div>
+        </div>
+        <!-- Complétude données -->
+        <div style="background:{t['card_bg']};border:1px solid {t['border']};border-top:3px solid #0d9488;border-radius:14px;padding:22px 22px 18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <div style="font-size:0.68rem;font-weight:600;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;">Complétude données</div>
+                <div style="width:32px;height:32px;border-radius:8px;background:rgba(22,163,74,0.1);display:flex;align-items:center;justify-content:center;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                </div>
+            </div>
+            <div style="font-size:2.4rem;font-weight:800;color:{t['text_primary']};line-height:1;">{_completeness}<span style="font-size:1.2rem;font-weight:600;">%</span></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                <span style="font-size:0.65rem;font-weight:600;color:{t['text_secondary']};">
+                    {_incomp} champ(s) vide(s)</span>
+                <span style="font-size:0.7rem;color:{t['text_secondary']};">{_incomp} enregistrement(s) incomplet(s)</span>
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # =====================================================================
+    # ROW 2 — Trend Chart + Conformité Ring
+    # =====================================================================
+    col_chart, col_ring = st.columns([1.6, 1])
+
+    with col_chart:
+        _trend_data = load_compliance_trend()
+        if _trend_data:
+            trend_df = pd.DataFrame(_trend_data)
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=trend_df["date"], y=trend_df["score"],
+                mode="lines+markers",
+                line=dict(color="#0d9488", width=2.5, shape="spline"),
+                marker=dict(size=6, color="#0d9488"),
+                fill="tozeroy",
+                fillcolor="rgba(13,148,136,0.08)",
+                name="Score",
+            ))
+            fig_trend.add_hline(y=80, line_dash="dot", line_color="#94a3b8", opacity=0.6,
+                               annotation_text="Objectif 80", annotation_position="right")
+            fig_trend = plotly_layout(fig_trend, t, height=260)
+            fig_trend.update_layout(
+                yaxis_range=[0, 100], showlegend=True,
+                legend=dict(orientation="h", x=0.6, y=1.12, font=dict(size=10)),
+            )
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:20px 22px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px;">'
+                f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Évolution du score de conformité</span></div>'
+                f'<div style="font-size:0.72rem;color:{t["text_secondary"]};margin-left:11px;margin-bottom:8px;">7 derniers jours · objectif 80 %</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:60px 20px;text-align:center;color:{t["text_secondary"]};font-size:0.85rem;">'
+                f'Le graphique apparaîtra après la première analyse.</div>',
+                unsafe_allow_html=True,
+            )
+
+    with col_ring:
+        # Conformité donut ring
+        _cs = compliance_score if compliance_score is not None else 0
+        _ring_color = "#0d9488" if _cs >= 70 else ("#eab308" if _cs >= 40 else "#dc2626")
+        _ring_status = "Conforme" if _cs >= 80 else "À surveiller" if _cs >= 50 else "Critique"
+        _ring_status_color = "#0d9488" if _cs >= 80 else "#eab308" if _cs >= 50 else "#dc2626"
+        if compliance_score is None:
+            _ring_color = "#94a3b8"
+            _ring_status = "Non analysé"
+            _ring_status_color = "#94a3b8"
+        _pct = _cs
+        _ring_bg = t["border_subtle"]
+        _ring_score_display = f"{compliance_score}%" if compliance_score is not None else "—"
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:24px 22px;text-align:center;">'
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:20px;justify-content:flex-start;">'
+            f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Conformité globale</span></div>'
+            f'<div style="position:relative;width:180px;height:180px;margin:0 auto;">'
+            f'<svg viewBox="0 0 36 36" style="width:180px;height:180px;transform:rotate(-90deg);">'
+            f'<path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="{_ring_bg}" stroke-width="3"/>'
+            f'<path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="{_ring_color}" stroke-width="3" stroke-dasharray="{_pct}, 100" stroke-linecap="round"/>'
+            f'</svg>'
+            f'<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;">'
+            f'<div style="font-size:2.2rem;font-weight:800;color:{t["text_primary"]};line-height:1;">{_ring_score_display}</div>'
+            f'<div style="font-size:0.65rem;font-weight:600;color:{t["text_secondary"]};text-transform:uppercase;letter-spacing:0.1em;margin-top:4px;">Conformité</div>'
+            f'</div></div>'
+            f'<div style="margin-top:16px;display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;background:rgba({",".join(str(int(_ring_status_color[i:i+2], 16)) for i in (1,3,5))},0.1);font-size:0.72rem;font-weight:600;color:{_ring_status_color};">'
+            f'⊘ {_ring_status}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # =====================================================================
+    # ROW 3 — Rules + Anomalies
+    # =====================================================================
+    col_rules, col_anomalies = st.columns([1, 1.3])
+
+    with col_rules:
+        if _hits_data:
+            rules_df = pd.DataFrame(_hits_data).sort_values("hits", ascending=False).head(8)
+            bars_html = ""
+            max_hits = rules_df["hits"].max() or 1
+            for _, row in rules_df.iterrows():
+                pct = round(row["hits"] / max_hits * 100)
+                bars_html += (
+                    f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">'
+                    f'<div style="width:44px;font-size:0.78rem;font-weight:600;color:{t["text_secondary"]};">{row["rule"]}</div>'
+                    f'<div style="flex:1;height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+                    f'<div style="height:100%;width:{pct}%;border-radius:4px;background:#0d9488;"></div></div>'
+                    f'<div style="width:24px;font-size:0.78rem;font-weight:700;color:{t["text_primary"]};text-align:right;">{int(row["hits"])}</div>'
+                    f'</div>'
+                )
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;">'
+                f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+                f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Règles déclenchées</span></div>'
+                f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">Top 8 · par occurrences</span></div>'
+                f'{bars_html}</div>',
+                unsafe_allow_html=True,
+            )
+
+    with col_anomalies:
+        recent = _relevant_findings[:6] if _relevant_findings else []
+        rows_html = ""
+        for f in recent:
+            name = f.get("company_name", "?")
+            initial = name[0].upper() if name else "?"
+            sev = f.get("severity", "LOW")
+            if sev == "HIGH":
+                av_bg = "#dc2626"
+                badge_text = "CRITIQUE"
+                badge_bg = "rgba(220,38,38,0.1)"
+                badge_color = "#dc2626"
+            elif sev == "MEDIUM":
+                av_bg = "#f59e0b"
+                badge_text = "MOYENNE"
+                badge_bg = "rgba(245,158,11,0.1)"
+                badge_color = "#92400e"
+            else:
+                av_bg = "#3b82f6"
+                badge_text = "FAIBLE"
+                badge_bg = "rgba(59,130,246,0.1)"
+                badge_color = "#1d4ed8"
+            rows_html += (
+                f'<div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid {t["border_subtle"]};">'
+                f'<div style="width:36px;height:36px;border-radius:50%;background:{av_bg};display:flex;align-items:center;'
+                f'justify-content:center;color:#fff;font-weight:700;font-size:0.82rem;flex-shrink:0;">{initial}</div>'
+                f'<div style="flex:1;min-width:0;">'
+                f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{html.escape(name)}</div>'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-top:3px;">'
+                f'<span style="background:{badge_bg};color:{badge_color};padding:1px 7px;border-radius:4px;font-size:0.6rem;font-weight:700;">{badge_text}</span>'
+                f'<span style="font-size:0.7rem;color:{t["text_secondary"]};">{html.escape(f.get("finding_type", ""))}</span></div>'
+                f'</div>'
+                f'<div style="font-size:0.68rem;color:{t["text_secondary"]};white-space:nowrap;">{html.escape(f.get("rule_id", "")[:8])}</div>'
+                f'</div>'
+            )
+        if not rows_html:
+            rows_html = f'<div style="text-align:center;padding:30px 0;font-size:0.8rem;color:{t["text_secondary"]};">Aucune anomalie détectée</div>'
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Dernières anomalies</span></div>'
+            f'<span style="font-size:0.72rem;color:{t["accent"]};font-weight:600;cursor:pointer;">Tout voir →</span></div>'
+            f'{rows_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # =====================================================================
+    # ROW 4 — Severity + Status
+    # =====================================================================
+    col_sev, col_status = st.columns(2)
+
+    with col_sev:
+        total_f = len(_relevant_findings) or 1
+        high_pct = round(high_count / total_f * 100)
+        med_pct = round(med_count / total_f * 100)
+        low_pct = round(low_count / total_f * 100)
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Répartition par sévérité</span></div>'
+            f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">{len(_relevant_findings)} anomalies</span></div>'
+            # Élevée
+            f'<div style="margin-bottom:18px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="width:10px;height:10px;border-radius:50%;background:#ef4444;"></span>'
+            f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Élevée</span></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{high_count}</span></div>'
+            f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+            f'<div style="height:100%;width:{max(high_pct,2)}%;border-radius:4px;background:#ef4444;"></div></div></div>'
+            # Moyenne
+            f'<div style="margin-bottom:18px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="width:10px;height:10px;border-radius:50%;background:#f59e0b;"></span>'
+            f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Moyenne</span></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{med_count}</span></div>'
+            f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+            f'<div style="height:100%;width:{max(med_pct,2)}%;border-radius:4px;background:#f59e0b;"></div></div></div>'
+            # Faible
+            f'<div>'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="width:10px;height:10px;border-radius:50%;background:#14b8a6;"></span>'
+            f'<span style="font-size:0.82rem;color:{t["text_primary"]};">Faible</span></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{low_count}</span></div>'
+            f'<div style="height:8px;border-radius:4px;background:{t["border_subtle"]};">'
+            f'<div style="height:100%;width:{max(low_pct,2)}%;border-radius:4px;background:#14b8a6;"></div></div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_status:
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Statuts de traitement</span></div>'
+            f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">Sujet : conformité</span></div>'
+            f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">'
+            # Ouvert
+            f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#2563eb;line-height:1;">{open_count}</div>'
+            f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+            f'<span style="width:7px;height:7px;border-radius:50%;background:#2563eb;"></span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Ouvert</span></div></div>'
+            # En revue
+            f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#f59e0b;line-height:1;">{review_count}</div>'
+            f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+            f'<span style="width:7px;height:7px;border-radius:50%;background:#f59e0b;"></span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">En revue</span></div></div>'
+            # Résolu
+            f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#0d9488;line-height:1;">{resolved_count}</div>'
+            f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+            f'<span style="width:7px;height:7px;border-radius:50%;background:#0d9488;"></span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Résolu</span></div></div>'
+            # Rejeté
+            f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:16px 18px;">'
+            f'<div style="font-size:1.8rem;font-weight:800;color:#94a3b8;line-height:1;">{dismissed_count}</div>'
+            f'<div style="display:flex;align-items:center;gap:5px;margin-top:6px;">'
+            f'<span style="width:7px;height:7px;border-radius:50%;background:#94a3b8;"></span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">Rejeté</span></div></div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # =====================================================================
+    # ROW 5 — Top Accounts
+    # =====================================================================
+    acct_hits = {}
+    for f in _relevant_findings:
+        acct_hits[f["account_id"]] = acct_hits.get(f["account_id"], {"name": f["company_name"], "count": 0})
+        acct_hits[f["account_id"]]["count"] += 1
+    top_accounts = sorted(acct_hits.values(), key=lambda x: x["count"], reverse=True)[:8]
+
+    if top_accounts:
+        acct_cards = ""
+        for acc in top_accounts:
+            name = acc["name"]
+            initials = "".join(w[0] for w in name.split()[:2]).upper() if name else "?"
+            acct_cards += (
+                f'<div style="display:flex;align-items:center;gap:12px;padding:14px 18px;'
+                f'background:{t["border_subtle"]};border-radius:12px;min-width:200px;flex-shrink:0;">'
+                f'<div style="width:40px;height:40px;border-radius:50%;background:#1e293b;display:flex;align-items:center;'
+                f'justify-content:center;color:#fff;font-weight:700;font-size:0.74rem;flex-shrink:0;">{initials}</div>'
+                f'<div style="flex:1;min-width:0;">'
+                f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{html.escape(name)}</div>'
+                f'<div style="font-size:0.68rem;color:{t["text_secondary"]};">Client</div></div>'
+                f'<div style="width:30px;height:30px;border-radius:50%;background:rgba(220,38,38,0.08);display:flex;align-items:center;'
+                f'justify-content:center;font-size:0.76rem;font-weight:700;color:#e11d48;flex-shrink:0;">{acc["count"]}</div>'
+                f'</div>'
+            )
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;margin-top:16px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="width:3px;height:18px;border-radius:2px;background:{t["accent"]};"></div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Comptes les plus impactés</span></div>'
+            f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">nombre d\'anomalies</span></div>'
+            f'<div style="display:flex;gap:12px;overflow-x:auto;padding-bottom:4px;">{acct_cards}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def page_customer_data():
+    t = get_theme()
+    accent = t['accent']
+
+    # Initialize wizard state
+    if "import_wizard_step" not in st.session_state:
+        st.session_state["import_wizard_step"] = 1
+    if "import_mode" not in st.session_state:
+        st.session_state["import_mode"] = "file"
+
+    _step = st.session_state["import_wizard_step"]
+    _mode = st.session_state["import_mode"]
+
+    # --- Page header ---
+    _title = "Importer un fichier" if _mode == "file" else "Données clients"
+    st.markdown(
+        f'<div style="margin-bottom:6px;">'
+        f'<h1 style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px;">{_title}</h1>'
+        f'<p style="font-size:0.85rem;color:{t["text_secondary"]};margin:0;">{"Votre fichier remplacera la source Snowflake pour cette analyse." if _mode == "file" else "Sélectionnez la table à analyser."}</p>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Stepper ---
+    _steps_labels = ["Dépôt du fichier", "Correspondance des colonnes", "Règles"] if _mode == "file" else ["Sélection de la table", "Correspondance des colonnes", "Règles"]
+    _stepper_html = '<div style="display:flex;align-items:center;gap:0;margin-bottom:28px;">'
+    for i, lbl in enumerate(_steps_labels, 1):
+        if i < _step:
+            _num_style = f"width:26px;height:26px;border-radius:50%;background:#059669;color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;"
+            _pill_style = f"display:flex;align-items:center;gap:8px;padding:8px 18px;border-radius:999px;border:1px solid {t['border']};"
+            _lbl_style = f"font-size:0.8rem;color:{t['text_primary']};font-weight:500;"
+        elif i == _step:
+            _num_style = f"width:26px;height:26px;border-radius:50%;background:#059669;color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;"
+            _pill_style = f"display:flex;align-items:center;gap:8px;padding:8px 18px;border-radius:999px;border:2px solid {accent};background:rgba(13,148,136,0.04);"
+            _lbl_style = f"font-size:0.8rem;color:{t['text_primary']};font-weight:700;"
+        else:
+            _num_style = f"width:26px;height:26px;border-radius:50%;background:{t['border_subtle']};color:{t['text_secondary']};display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:600;"
+            _pill_style = f"display:flex;align-items:center;gap:8px;padding:8px 18px;border-radius:999px;border:1px solid {t['border']};"
+            _lbl_style = f"font-size:0.8rem;color:{t['text_secondary']};font-weight:500;"
+        _stepper_html += f'<div style="{_pill_style}"><div style="{_num_style}">{i}</div><span style="{_lbl_style}">{lbl}</span></div>'
+        if i < len(_steps_labels):
+            _stepper_html += f'<div style="width:40px;height:0;border-top:2px dashed {t["border"]};margin:0 4px;"></div>'
+    _stepper_html += '</div>'
+    st.markdown(_stepper_html, unsafe_allow_html=True)
+
+    # ===================== STEP 1 =====================
+    if _step == 1:
+        if _mode == "file":
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:2px dashed {t["border"]};border-radius:16px;padding:40px 30px;text-align:center;margin-bottom:20px;">'
+                f'<div style="width:56px;height:56px;border-radius:50%;background:rgba(13,148,136,0.08);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;">'
+                f'<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>'
+                f'<div style="font-size:1rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Glissez votre fichier ici</div>'
+                f'<div style="font-size:0.78rem;color:{t["text_secondary"]};">CSV, TSV, XLSX, XLS, XLSM · 200 Mo max · colonnes détectées automatiquement</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            uploaded = st.file_uploader("Parcourir...", type=["csv", "txt", "tsv", "xlsx", "xls", "xlsm"], key="import_wizard_file", label_visibility="collapsed")
+
+            if uploaded:
+                try:
+                    df_raw = load_uploaded_file(uploaded)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    df_raw = None
+                if df_raw is not None:
+                    st.session_state["import_wizard_df"] = df_raw
+                    st.session_state["import_wizard_filename"] = uploaded.name
+                    _size_kb = uploaded.size / 1024
+                    _size_label = f"{_size_kb:.1f} Ko" if _size_kb < 1024 else f"{_size_kb/1024:.1f} Mo"
+                    st.markdown(
+                        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:18px 22px;display:flex;align-items:center;gap:14px;margin-bottom:16px;">'
+                        f'<div style="width:42px;height:42px;border-radius:10px;background:{t["border_subtle"]};display:flex;align-items:center;justify-content:center;">'
+                        f'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="{t["text_secondary"]}" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>'
+                        f'<div>'
+                        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">{html.escape(uploaded.name)}</div>'
+                        f'<div style="display:flex;align-items:center;gap:6px;margin-top:3px;">'
+                        f'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{len(df_raw)} lignes</span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{len(df_raw.columns)} colonnes</span>'
+                        f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{_size_label}</span>'
+                        f'</div></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                    _alias_map = detect_column_mapping(list(df_raw.columns))
+                    _mapped_count = sum(1 for v in _alias_map.values() if v)
+                    st.markdown(
+                        f'<div style="background:rgba(13,148,136,0.06);border:1px solid rgba(13,148,136,0.2);border-radius:10px;padding:12px 18px;margin-bottom:18px;display:flex;align-items:center;gap:10px;">'
+                        f'<span style="font-size:1rem;">✦</span>'
+                        f'<span style="font-size:0.82rem;color:#065f46;">{_mapped_count} colonnes sur {len(df_raw.columns)} ont été reconnues automatiquement. Vérifiez la correspondance à l\'étape suivante.</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">'
+                        f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+                        f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Aperçu · 3 premières lignes</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    _preview = df_raw.head(3)
+                    _header_html = "".join(f'<th style="padding:10px 14px;text-align:left;font-size:0.72rem;font-weight:600;color:{accent};font-family:monospace;border-bottom:2px solid {t["border"]};">{html.escape(c)}</th>' for c in _preview.columns)
+                    _rows_html = ""
+                    for _, row in _preview.iterrows():
+                        _cells = "".join(f'<td style="padding:10px 14px;font-size:0.8rem;color:{t["text_primary"]};border-bottom:1px solid {t["border_subtle"]};">{html.escape(str(v) if pd.notna(v) else "")}</td>' for v in row)
+                        _rows_html += f"<tr>{_cells}</tr>"
+                    st.markdown(
+                        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:12px;overflow:hidden;margin-bottom:24px;">'
+                        f'<table style="width:100%;border-collapse:collapse;"><thead><tr>{_header_html}</tr></thead><tbody>{_rows_html}</tbody></table></div>',
+                        unsafe_allow_html=True,
+                    )
+                    _nav1, _nav2 = st.columns([1, 1])
+                    with _nav1:
+                        _db_default = st.session_state.get("sf_database", "QUALITY_TEST")
+                        _sch_default = st.session_state.get("sf_schema", "DATA_QUALITY")
+                        _default_tbl = uploaded.name.rsplit(".", 1)[0].upper().replace(" ", "_").replace("-", "_")
+                        _dbs = list_snowflake_databases()
+                        _db_idx = _dbs.index(_db_default) if _db_default in _dbs else 0
+                        _col_db, _col_sch = st.columns(2)
+                        with _col_db:
+                            _db_input = st.selectbox("Database", _dbs, index=_db_idx, key="import_wizard_db")
+                        with _col_sch:
+                            _schemas = list_snowflake_schemas(_db_input)
+                            _sch_idx = _schemas.index(_sch_default) if _sch_default in _schemas else 0
+                            _sch_input = st.selectbox("Schema", _schemas, index=_sch_idx, key="import_wizard_schema")
+                        _tbl_name = st.text_input(
+                            "Nom de la table",
+                            value=_default_tbl,
+                            key="import_wizard_table_name",
+                        )
+                        st.session_state["import_target_table"] = f"{_db_input}.{_sch_input}.{_tbl_name}"
+                        st.caption(f"Table cible : `{_db_input}.{_sch_input}.{_tbl_name}`")
+                    with _nav2:
+                        st.markdown(f'<div style="height:28px;"></div>', unsafe_allow_html=True)
+                        if st.button("Continuer : mapper les colonnes  \u203A", type="primary", use_container_width=True, key="import_next_1"):
+                            st.session_state["import_wizard_step"] = 2
+                            st.rerun()
+        else:
+            # TABLE MODE
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 26px;margin-bottom:20px;">'
+                f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:12px;">Sélectionnez la table à analyser</div>'
+                f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">La table sera lue directement depuis Snowflake. Aucune copie n\'est effectuée.</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            _primary = _dim_account_fqn()
+            _db = st.session_state.get("sf_database", "QUALITY_TEST")
+            _sch = st.session_state.get("sf_schema", "COMMERCIAL_DATA")
+            _tables_raw = list_snowflake_tables(_db, _sch)
+            _tables = [f"{_db}.{_sch}.{tbl}" for tbl in _tables_raw]
+            _options = [_primary] + [tbl for tbl in _tables if tbl != _primary]
+            _chosen_table = st.selectbox("Table Snowflake", _options, index=0, key="import_table_select")
+            st.session_state["import_wizard_table"] = _chosen_table
+            _preview_df = load_table_as_dataframe(_chosen_table)
+            if not _preview_df.empty:
+                st.session_state["import_wizard_df"] = _preview_df
+                st.markdown(f'<div style="display:flex;align-items:center;gap:8px;margin:18px 0 10px;"><div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div><span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Aperçu · 3 premières lignes</span></div>', unsafe_allow_html=True)
+                st.dataframe(_preview_df.head(3), use_container_width=True, hide_index=True)
+                st.caption(f"{len(_preview_df)} lignes · {len(_preview_df.columns)} colonnes")
+            _nav1, _nav2 = st.columns([1, 1])
+            with _nav1:
+                if st.button("\u2039  Annuler", key="import_cancel_1t"):
+                    st.session_state["page"] = "dashboard"
+                    st.rerun()
+            with _nav2:
+                if st.button("Continuer : mapper les colonnes  \u203A", type="primary", use_container_width=True, key="import_next_1t"):
+                    st.session_state["import_wizard_step"] = 2
+                    st.rerun()
+
+    # ===================== STEP 2: COLUMN MAPPING =====================
+    elif _step == 2:
+        df_raw = st.session_state.get("import_wizard_df")
+        if df_raw is None or (hasattr(df_raw, 'empty') and df_raw.empty):
+            st.warning("Aucune donnée chargée. Veuillez retourner à l'étape 1.")
+            if st.button("Retour", key="import_back_nodata"):
+                st.session_state["import_wizard_step"] = 1
+                st.rerun()
+            return
+        _fname = st.session_state.get("import_wizard_filename", st.session_state.get("import_wizard_table", "Table"))
+        cols = list(df_raw.columns)
+        if "import_wizard_automap" not in st.session_state:
+            # Clear stale selectbox keys from previous file uploads
+            for _f in IMPORT_FIELD_LABELS:
+                st.session_state.pop(f"import_map_{_f}", None)
+            with st.spinner("Détection intelligente des colonnes..."):
+                ai_map = detect_column_mapping_ai(tuple(df_raw.columns))
+            alias_map = detect_column_mapping(cols)
+            auto_map = {}
+            for field in IMPORT_FIELD_LABELS:
+                if alias_map.get(field):
+                    auto_map[field] = alias_map[field]
+                elif ai_map.get(field):
+                    auto_map[field] = ai_map[field]
+                else:
+                    auto_map[field] = None
+            st.session_state["import_wizard_automap"] = auto_map
+        else:
+            auto_map = st.session_state["import_wizard_automap"]
+        _mapped_count = sum(1 for v in auto_map.values() if v)
+        _total_fields = len(IMPORT_FIELD_LABELS)
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:16px 22px;display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;">'
+            f'<div style="display:flex;align-items:center;gap:12px;">'
+            f'<div style="width:38px;height:38px;border-radius:10px;background:{t["border_subtle"]};display:flex;align-items:center;justify-content:center;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{t["text_secondary"]}" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>'
+            f'<div><div style="font-size:0.9rem;font-weight:700;color:{t["text_primary"]};">{html.escape(_fname)}</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Associez chaque champ attendu par Léon à une colonne de votre fichier.</div></div></div>'
+            f'<div style="padding:6px 14px;border-radius:8px;background:rgba(13,148,136,0.08);border:1px solid rgba(13,148,136,0.2);">'
+            f'<span style="font-family:monospace;font-size:0.82rem;font-weight:700;color:#059669;">{_mapped_count} / {_total_fields} mappés</span></div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div style="display:flex;align-items:center;padding:0 10px;margin-bottom:8px;">'
+            f'<div style="flex:1;font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:{t["text_secondary"]};">Champ attendu par Léon</div>'
+            f'<div style="flex:1;font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:{t["text_secondary"]};text-align:right;">Colonne de votre fichier</div></div>',
+            unsafe_allow_html=True,
+        )
+        _required_fields = {"company_name", "siren"}
+        mapping = {}
+        options = ["— Non mappé —"] + cols
+        for field, label in IMPORT_FIELD_LABELS.items():
+            _is_required = field in _required_fields
+            _auto_val = auto_map.get(field)
+            _default_idx = 0
+            if _auto_val and _auto_val in options:
+                _default_idx = options.index(_auto_val)
+            _ss_key = f"import_map_{field}"
+            _col_left, _col_arrow, _col_right = st.columns([2, 0.3, 2])
+            with _col_left:
+                _req_badge = '<span style="font-size:0.6rem;font-weight:700;padding:2px 7px;border-radius:4px;background:rgba(239,68,68,0.1);color:#ef4444;margin-left:8px;">Requis</span>' if _is_required else ""
+                st.markdown(
+                    f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:10px;padding:14px 16px;display:flex;align-items:center;gap:10px;">'
+                    f'<div style="width:30px;height:30px;border-radius:8px;background:{t["border_subtle"]};display:flex;align-items:center;justify-content:center;">'
+                    f'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="{t["text_secondary"]}" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg></div>'
+                    f'<span style="font-size:0.88rem;font-weight:600;color:{t["text_primary"]};">{label}</span>{_req_badge}</div>',
+                    unsafe_allow_html=True,
+                )
+            with _col_arrow:
+                st.markdown(f'<div style="text-align:center;padding-top:14px;color:{t["text_secondary"]};">\u2192</div>', unsafe_allow_html=True)
+            with _col_right:
+                chosen = st.selectbox(label, options, index=_default_idx, key=_ss_key, label_visibility="collapsed")
+            mapping[field] = None if chosen == "— Non mappé —" else chosen
+        st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+        _nav1, _nav2 = st.columns([1, 1])
+        with _nav1:
+            if st.button("\u2039  Retour", key="import_back_2"):
+                st.session_state["import_wizard_step"] = 1
+                st.session_state.pop("import_wizard_automap", None)
+                for _f in IMPORT_FIELD_LABELS:
+                    st.session_state.pop(f"import_map_{_f}", None)
+                st.rerun()
+        with _nav2:
+            if st.button("Valider et continuer  \u203A", type="primary", use_container_width=True, key="import_validate"):
+                st.session_state["wizard_uploaded_df"] = df_raw
+                st.session_state["wizard_source"] = _mode
+                st.session_state["wizard_file_upload"] = _fname
+                st.session_state["wizard_mapping"] = mapping
+                st.session_state["import_wizard_step"] = 3
+                st.rerun()
+
+    # ===================== STEP 3 — RÈGLES =====================
+    elif _step == 3:
+        # Determine source info
+        _src_table = st.session_state.get("import_wizard_table", _dim_account_fqn())
+        _src_fname = st.session_state.get("wizard_file_upload", "")
+        _src_mode_label = _src_fname if _mode == "file" else _src_table
+        _src_short = _src_mode_label.split(".")[-1] if "." in _src_mode_label else _src_mode_label
+        if "wizard_uploaded_df" in st.session_state and st.session_state["wizard_uploaded_df"] is not None:
+            _src_rows = len(st.session_state["wizard_uploaded_df"])
+        elif "uploaded_df" in st.session_state and not st.session_state.get("uploaded_df", pd.DataFrame()).empty:
+            _src_rows = len(st.session_state["uploaded_df"])
+        else:
+            _raw = load_dim_account(_src_table)
+            _src_rows = len(_raw) if _raw else 0
+
+        # --- Header ---
+        st.markdown(
+            f'<div style="font-size:1.5rem;font-weight:800;color:{t["text_primary"]};margin-bottom:4px;">Presque prêt à lancer</div>'
+            f'<div style="font-size:0.82rem;color:{t["text_secondary"]};margin-bottom:20px;">Vos données sont chargées. Ajoutez éventuellement vos règles métier, puis lancez l\'analyse.</div>',
+            unsafe_allow_html=True,
+        )
+
+        # --- Source ready banner ---
+        _src_col1, _src_col2 = st.columns([5, 1])
+        with _src_col1:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:14px;background:rgba(5,150,105,0.06);border:1px solid rgba(5,150,105,0.2);border-radius:12px;padding:16px 20px;">'
+                f'<div style="width:36px;height:36px;border-radius:50%;background:#059669;display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
+                f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>'
+                f'<div>'
+                f'<div style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Source prête</div>'
+                f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:2px;">{html.escape(_src_short)} · {_src_rows} lignes</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+        with _src_col2:
+            if st.button("< Changer", key="rules_change_src"):
+                st.session_state["import_wizard_step"] = 1
+                st.rerun()
+
+        st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+
+        # --- Standard rules card ---
+        _std_rules = FR_BUSINESS_RULES + [{"id": "INSEE", "name": "Registre SIRENE", "check": "29M+ entreprises"}]
+        _n_std = len(_std_rules)
+        _badges_html = " ".join(
+            f'<span style="font-size:0.68rem;font-weight:600;padding:3px 8px;border-radius:4px;'
+            f'background:{t["accent_soft"]};color:{accent};margin-right:4px;">{r["id"]}</span>'
+            for r in _std_rules
+        )
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:20px 24px;display:flex;align-items:center;gap:16px;">'
+            f'<div style="width:40px;height:40px;border-radius:50%;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
+            f'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>'
+            f'<div style="flex:1;">'
+            f'<div style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Les contrôles standard sont déjà activés</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:3px;">Validation SIREN, SIRET, TVA, e-facturation et croisement INSEE — rien à configurer.</div>'
+            f'<div style="margin-top:10px;">{_badges_html}</div>'
+            f'</div>'
+            f'<div style="text-align:center;flex-shrink:0;">'
+            f'<div style="font-size:1.4rem;font-weight:800;color:{t["text_primary"]};">{_n_std}</div>'
+            f'<div style="font-size:0.62rem;font-weight:700;letter-spacing:0.08em;color:{t["text_secondary"]};text-transform:uppercase;">Actifs</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div style="height:24px;"></div>', unsafe_allow_html=True)
+
+        # --- Optional custom rules section ---
+        st.markdown(
+            f'<div style="font-size:1.1rem;font-weight:700;color:{t["text_primary"]};margin-bottom:4px;">Voulez-vous ajouter vos propres règles métier ?</div>'
+            f'<div style="font-size:0.78rem;color:{t["text_secondary"]};margin-bottom:16px;">Facultatif — c\'est le bon moment si vous avez des contrôles spécifiques à votre activité.</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Two action cards
+        _ac1, _ac2 = st.columns(2)
+        with _ac1:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;height:100%;">'
+                f'<div style="width:40px;height:40px;border-radius:50%;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+                f'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="{accent}" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>'
+                f'<div style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Créer une règle</div>'
+                f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Ajoutez un contrôle sur mesure (e-mail, téléphone, code postal…) en quelques clics.</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Créer une règle >", key="rules_create", use_container_width=True):
+                st.session_state["page"] = "rule_catalog"
+                st.rerun()
+
+        with _ac2:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 20px;height:100%;">'
+                f'<div style="width:40px;height:40px;border-radius:50%;background:rgba(99,102,241,0.08);display:flex;align-items:center;justify-content:center;margin-bottom:14px;">'
+                f'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>'
+                f'<div style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};margin-bottom:6px;">Importer un fichier de règles</div>'
+                f'<div style="font-size:0.75rem;color:{t["text_secondary"]};line-height:1.5;">Chargez tout un lot de règles depuis un CSV, TXT ou JSON. Détection automatique.</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            _rules_file = st.file_uploader("Fichier de règles", type=["csv", "json", "txt", "xlsx"], key="rules_import_file", label_visibility="collapsed")
+            if _rules_file:
+                # Skip if already processed this file (avoid re-running AI on every rerun)
+                _processed_name = st.session_state.get("_rules_file_processed")
+                if _processed_name == _rules_file.name:
+                    st.info(f"Fichier **{_rules_file.name}** déjà traité. Supprimez-le (×) pour en charger un autre.")
+                else:
+                    with st.spinner(f"Détection des règles dans {_rules_file.name}..."):
+                        try:
+                            _raw_content = _rules_file.read().decode("utf-8", errors="ignore")
+                            _imported = []
+
+                            # Try JSON first (structured)
+                            if _rules_file.name.endswith(".json"):
+                                try:
+                                    _parsed = json.loads(_raw_content)
+                                    _imported = _parsed if isinstance(_parsed, list) else [_parsed]
+                                except Exception:
+                                    pass
+
+                            # If not JSON or JSON failed, use Cortex AI to detect rules from ANY format
+                            if not _imported:
+                                _prompt = f"""Analyse ce fichier de règles métier et extrais chaque règle de qualité de données.
+Le fichier peut être dans n'importe quel format (CSV, texte libre, tableau, liste...).
+
+Contenu du fichier:
+---
+{_raw_content[:3000]}
+---
+
+Pour chaque règle trouvée, retourne un objet JSON avec:
+- "name": nom descriptif de la règle
+- "target_field": le champ/colonne ciblé (ex: email, siren, telephone, cp, adresse...)
+- "rule_type": un parmi "regex", "not_empty", "in_list", "length"
+- "pattern": le pattern de validation (regex, ou "min:max" pour length, ou liste pour in_list)
+- "severity": "HIGH", "MEDIUM", ou "LOW"
+- "description": description courte
+
+Retourne UNIQUEMENT un tableau JSON valide, rien d'autre."""
+
+                                try:
+                                    _safe_prompt = _prompt.replace("$$", "\\$\\$")
+                                    _result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${_safe_prompt}$$) AS r")
+                                    if not _result.empty:
+                                        _raw_resp = str(_result.iloc[0]["r"]).strip()
+                                        if _raw_resp.startswith("```"):
+                                            _raw_resp = _raw_resp.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                                        _start = _raw_resp.index("[")
+                                        _end = _raw_resp.rindex("]") + 1
+                                        _imported = json.loads(_raw_resp[_start:_end])
+                                except Exception:
+                                    pass
+
+                            # Validate: keep rules with at least a name
+                            _valid = [
+                                r for r in _imported
+                                if r.get("name") and (r.get("target_field") or r.get("field"))
+                            ]
+                            if _valid:
+                                st.session_state.setdefault("wizard_custom_rules_import", []).extend(_valid)
+                                st.session_state["_rules_file_processed"] = _rules_file.name
+                                st.toast(f"{len(_valid)} règle(s) détectée(s) et importée(s)")
+                                st.rerun()
+                            elif _imported:
+                                st.session_state["_rules_file_processed"] = _rules_file.name
+                                st.warning(f"Le fichier a été lu mais aucune règle exploitable n'a été détectée.")
+                            else:
+                                st.session_state["_rules_file_processed"] = _rules_file.name
+                                st.warning("Impossible de détecter des règles dans ce fichier.")
+                        except Exception:
+                            st.session_state["_rules_file_processed"] = _rules_file.name
+                            st.error("Erreur lors de la lecture du fichier.")
+
+        st.markdown('<div style="height:16px;"></div>', unsafe_allow_html=True)
+
+        # --- List custom rules already added ---
+        _custom_db = list_custom_rules(active_only=True)
+        _custom_import = st.session_state.get("wizard_custom_rules_import", [])
+        _all_custom = _custom_db + _custom_import
+        _n_custom = len(_all_custom)
+
+        if _all_custom:
+            st.markdown(
+                f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;color:{t["text_secondary"]};'
+                f'text-transform:uppercase;margin-bottom:10px;">Règles personnalisées ajoutées · {_n_custom}</div>',
+                unsafe_allow_html=True,
+            )
+            for i, cr in enumerate(_all_custom):
+                _cr_name = cr.get("name", cr.get("id", f"Règle {i+1}"))
+                _cr_field = cr.get("target_field", cr.get("field", ""))
+                _cr_sev = cr.get("severity", "MEDIUM")
+                _cr_desc = cr.get("description", cr.get("pattern", ""))
+                _sev_color = "#dc2626" if _cr_sev == "HIGH" else ("#d97706" if _cr_sev == "MEDIUM" else "#3b82f6")
+                _cr_id_short = cr.get("id", f"R{i+1}")[:3].upper()
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:14px;background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:12px;padding:14px 18px;margin-bottom:6px;">'
+                    f'<div style="width:36px;height:36px;border-radius:8px;background:rgba(99,102,241,0.1);display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
+                    f'<span style="font-size:0.68rem;font-weight:800;color:#6366f1;">{html.escape(_cr_id_short)}</span></div>'
+                    f'<div style="flex:1;">'
+                    f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};">{html.escape(_cr_name)}</div>'
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-top:3px;">'
+                    f'<span style="font-size:0.68rem;padding:2px 6px;border-radius:4px;background:rgba(0,0,0,0.04);color:{t["text_secondary"]};">{html.escape(_cr_field)}</span>'
+                    f'<span style="font-size:0.68rem;padding:2px 6px;border-radius:4px;background:rgba(0,0,0,0.04);color:{_sev_color};">{_cr_sev}</span>'
+                    f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">{html.escape(str(_cr_desc)[:60])}</span>'
+                    f'</div></div></div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown('<div style="height:20px;"></div>', unsafe_allow_html=True)
+
+        # --- Launch banner ---
+        _total_rules = _n_std + _n_custom
+        _summary = f"{_n_std} règles standard"
+        if _n_custom:
+            _summary += f" + {_n_custom} personnalisée{'s' if _n_custom > 1 else ''}"
+        _summary += f" seront appliquées sur {_src_rows} lignes"
+
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:18px 24px;'
+            f'display:flex;align-items:center;justify-content:space-between;">'
+            f'<div>'
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Prêt à lancer</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:2px;">{_summary}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Lancer l'analyse  \u203A", type="primary", use_container_width=True, key="rules_launch"):
+            st.session_state["page"] = "run_analysis"
+            st.session_state["wizard_step"] = 3
+            st.rerun()
+
+
+def page_run_analysis():
+    t = get_theme()
+    accent = t['accent']
+
+    # --- Premium header ---
+    st.markdown(f'''
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:28px;">
+        <div>
+            <h1 style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px;">Lancer l\u2019analyse</h1>
+            <p style="font-size:0.85rem;color:{t["text_secondary"]};margin:0;">Configurez et ex\u00e9cutez un contr\u00f4le qualit\u00e9 sur vos donn\u00e9es.</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:0.68rem;padding:4px 10px;background:rgba(14,156,138,0.1);color:{accent};
+                border-radius:999px;font-weight:600;">Moteur SQL</span>
+            <span style="font-size:0.68rem;padding:4px 10px;background:rgba(37,99,235,0.1);color:#2563eb;
+                border-radius:999px;font-weight:600;">INSEE 29M+</span>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    if "wizard_step" not in st.session_state:
+        st.session_state["wizard_step"] = 1
+    if "selected_subjects" not in st.session_state:
+        st.session_state["selected_subjects"] = ["compliance", "duplicates"]
+
+    step = st.session_state["wizard_step"]
+    steps = ["Sélection des sujets", "Périmètre", "Data Cleaning", "Exécution", "Résultats"]
+
+    # --- Premium wizard stepper with connected line ---
+    step_items = ""
+    for i, label in enumerate(steps, 1):
+        if i < step:
+            dot_style = f"width:28px;height:28px;border-radius:50%;background:{t['success']};color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.7rem;font-weight:700;"
+            dot_content = "✓"
+            label_style = f"font-size:0.72rem;color:{t['success']};font-weight:600;margin-top:4px;"
+        elif i == step:
+            dot_style = f"width:28px;height:28px;border-radius:50%;background:{accent};color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;box-shadow:0 0 0 3px {t['accent_soft']};"
+            dot_content = str(i)
+            label_style = f"font-size:0.72rem;color:{accent};font-weight:700;margin-top:4px;"
+        else:
+            dot_style = f"width:28px;height:28px;border-radius:50%;background:{t['border_subtle']};color:{t['text_secondary']};display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:600;border:1px solid {t['border']};"
+            dot_content = str(i)
+            label_style = f"font-size:0.72rem;color:{t['text_secondary']};font-weight:500;margin-top:4px;"
+
+        connector = ""
+        if i < len(steps):
+            line_color = t['success'] if i < step else t['border']
+            connector = f'<div style="flex:1;height:2px;background:{line_color};margin:0 4px;"></div>'
+
+        step_items += f'<div style="display:flex;flex-direction:column;align-items:center;min-width:60px;"><div style="{dot_style}">{dot_content}</div><div style="{label_style}">{label}</div></div>{connector}'
+
+    st.markdown(
+        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:12px;padding:14px 20px;margin-bottom:12px;">'
+        f'<div style="display:flex;align-items:center;justify-content:center;">{step_items}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if step == 1:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Étape 1 — Sélection des sujets</span>'
+            f'</div>'
+            f'<p style="font-size:0.8rem;color:{t["text_secondary"]};margin:0 0 10px 13px;">Choisissez les dimensions de qualité à contrôler. La priorité indique l\'impact métier.</p>',
+            unsafe_allow_html=True,
+        )
+
+        # --- Select All / Reject All buttons ---
+        _col_sel_all, _col_rej_all, _col_spacer = st.columns([1, 1, 2])
+        with _col_sel_all:
+            if st.button("✔ Tout sélectionner", key="select_all_subjects", use_container_width=True):
+                st.session_state["selected_subjects"] = [s["id"] for s in ANALYSIS_SUBJECTS]
+                st.rerun()
+        with _col_rej_all:
+            if st.button("✘ Tout rejeter", key="reject_all_subjects", use_container_width=True):
+                st.session_state["selected_subjects"] = []
+                st.rerun()
+
+        selected = []
+        for subj in ANALYSIS_SUBJECTS:
+            checked = subj["id"] in st.session_state["selected_subjects"]
+            col_chk, col_content = st.columns([0.06, 0.94], gap="small")
+            with col_chk:
+                is_selected = st.checkbox(
+                    " ",
+                    value=checked,
+                    key=f"subj_{subj['id']}",
+                    label_visibility="collapsed",
+                )
+            with col_content:
+                # Enhanced subject card with rule count badge
+                border_color = accent if is_selected else t['border']
+                bg_card = f"linear-gradient(135deg, {t['accent_soft']} 0%, {t['card_bg']} 60%)" if is_selected else t['card_bg']
+                check_icon = f'<div style="width:20px;height:20px;border-radius:50%;background:{accent};display:inline-flex;align-items:center;justify-content:center;margin-right:8px;"><svg width="12" height="12" fill="none" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>' if is_selected else ""
+                prio = subj.get("priority", "P2")
+                prio_colors = {"P1": ("#ef4444", "rgba(239,68,68,0.12)"), "P2": ("#f59e0b", "rgba(245,158,11,0.12)"), "P3": ("#3b82f6", "rgba(59,130,246,0.12)")}
+                pc, pbg = prio_colors.get(prio, ("#94a3b8", t['border_subtle']))
+                st.markdown(
+                    f'<div style="background:{bg_card};border:1px solid {border_color};border-radius:10px;padding:12px 16px;margin-bottom:6px;'
+                    f'{"box-shadow:0 0 0 1px " + accent + ";" if is_selected else ""}">'
+                    f'<div style="display:flex;align-items:center;justify-content:space-between;">'
+                    f'<div style="display:flex;align-items:center;">{check_icon}<strong style="color:{t["text_primary"]};font-size:0.88rem;">{html.escape(subj["name"])}</strong></div>'
+                    f'<div style="display:flex;gap:6px;">'
+                    f'<span style="font-size:0.65rem;padding:2px 7px;border-radius:999px;background:{pbg};color:{pc};font-weight:600;">{prio}</span>'
+                    f'<span style="font-size:0.65rem;padding:2px 7px;border-radius:999px;background:{t["accent_soft"]};color:{accent};font-weight:600;">{subj["rules"]} règles</span>'
+                    f'</div></div>'
+                    f'<div style="font-size:0.76rem;color:{t["text_secondary"]};margin-top:4px;">{html.escape(subj["description"])}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            if is_selected:
+                selected.append(subj["id"])
+        st.session_state["selected_subjects"] = selected
+        if st.button("Suivant : Périmètre", type="primary"):
+            st.session_state["wizard_step"] = 2
+            st.rerun()
+
+    elif step == 2:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Étape 2 — Périmètre & règles</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        selected_names = [s["name"] for s in ANALYSIS_SUBJECTS if s["id"] in st.session_state["selected_subjects"]]
+        total_rules = sum(s["rules"] for s in ANALYSIS_SUBJECTS if s["id"] in st.session_state["selected_subjects"])
+        table_fqn = st.session_state.get("import_wizard_table", _dim_account_fqn())
+        # Check if file uploaded as source (wizard upload OR sidebar upload)
+        if "wizard_uploaded_df" in st.session_state:
+            _src_count = len(st.session_state["wizard_uploaded_df"])
+            _src_label = f"Fichier importé ({st.session_state.get('wizard_file_upload', 'fichier')})"
+        elif st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state:
+            _src_count = len(st.session_state["uploaded_df"])
+            _src_label = f"Fichier importé ({st.session_state.get('uploaded_filename', 'fichier')})"
+        elif table_fqn and not table_fqn.startswith(".."):
+            _src_count = len(load_dim_account(table_fqn))
+            _src_label = html.escape(table_fqn)
+        else:
+            _src_count = 0
+            _src_label = "Aucune source"
+        card(
+            f'<strong>Sujets :</strong> {", ".join(html.escape(n) for n in selected_names)}<br>'
+            f'<strong>Source :</strong> <code>{_src_label}</code><br>'
+            f'<strong>Enregistrements :</strong> {_src_count} comptes<br>'
+            f'<strong>Règles à exécuter :</strong> {total_rules}<br>'
+            f'<strong>Moteur :</strong> Snowflake (staging + SQL)<br>'
+            f'<strong>Durée estimée :</strong> ~{max(5, _src_count * total_rules // 10)} secondes'
+        )
+
+        extra_table = st.selectbox(
+            "Table additionnelle (autre jeu de règles)",
+            ["— Aucune —"] + [t for t in FR_AUDIT_TABLES if t != table_fqn],
+            key="wizard_extra_table",
+            help="Analyser une 2e table avec les mêmes règles personnalisées.",
+        )
+
+        # --- JOIN Table Configuration (Cortex AI) ---
+        st.markdown("---")
+        t = get_theme()
+        st.markdown(
+            f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};margin-bottom:8px;">Joindre une table secondaire</div>'
+            f'<div style="font-size:0.78rem;color:{t["text_secondary"]};margin-bottom:12px;">Cortex AI suggère automatiquement la clé de jointure et des règles qualité.</div>',
+            unsafe_allow_html=True,
+        )
+        join_enabled = st.toggle("Activer la jointure", key="wizard_join_enabled")
+
+        if join_enabled:
+            _db = st.session_state.get("sf_database", "")
+            _sch = st.session_state.get("sf_schema", "")
+            _all_tables = list_snowflake_tables(_db, _sch)
+            _available = [tb for tb in _all_tables if f"{_db}.{_sch}.{tb}" != table_fqn]
+
+            if not _available:
+                st.info("Aucune autre table disponible dans ce schéma.")
+            else:
+                secondary_name = st.selectbox("Table secondaire", _available, key="wizard_join_table_select")
+                secondary_fqn = f"{_db}.{_sch}.{secondary_name}"
+
+                # Load columns for both tables
+                primary_cols = load_table_columns(table_fqn)
+                sec_cols = load_table_columns(secondary_fqn)
+
+                if primary_cols and sec_cols:
+                    # Cortex AI suggests join key (cached in session)
+                    cache_key = f"_join_ai_{table_fqn}_{secondary_fqn}"
+                    if cache_key not in st.session_state:
+                        with st.spinner("Cortex AI analyse les clés de jointure..."):
+                            suggestion = suggest_join_key_cortex(primary_cols, sec_cols, table_fqn, secondary_fqn)
+                            st.session_state[cache_key] = suggestion
+
+                    suggestion = st.session_state.get(cache_key, {})
+                    confidence = suggestion.get("confidence", "low")
+                    conf_color = "#0d9488" if confidence == "high" else ("#d97706" if confidence == "medium" else t["text_secondary"])
+
+                    st.markdown(
+                        f'<div style="font-size:0.72rem;color:{conf_color};margin-bottom:8px;">'
+                        f'Suggestion Cortex AI (confiance: {confidence})</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    col_k1, col_k2 = st.columns(2)
+                    with col_k1:
+                        suggested_pk = suggestion.get("primary_key", "").upper()
+                        pk_index = 0
+                        upper_primary = [c.upper() for c in primary_cols]
+                        if suggested_pk in upper_primary:
+                            pk_index = upper_primary.index(suggested_pk)
+                        join_key_a = st.selectbox("Clé (table principale)", primary_cols, index=pk_index, key="wiz_jk_primary")
+
+                    with col_k2:
+                        suggested_sk = suggestion.get("secondary_key", "").upper()
+                        sk_index = 0
+                        upper_sec = [c.upper() for c in sec_cols]
+                        if suggested_sk in upper_sec:
+                            sk_index = upper_sec.index(suggested_sk)
+                        join_key_b = st.selectbox("Clé (table secondaire)", sec_cols, index=sk_index, key="wiz_jk_secondary")
+
+                    join_type = st.radio("Type de jointure", ["LEFT JOIN", "INNER JOIN"], horizontal=True, key="wiz_join_type")
+
+                    # Store join config
+                    st.session_state["wizard_join_config"] = {
+                        "table": secondary_fqn,
+                        "key_primary": join_key_a,
+                        "key_secondary": join_key_b,
+                        "join_type": join_type,
+                    }
+
+                    # --- AI Rule Suggestions for secondary table ---
+                    st.markdown("---")
+                    if st.button("Suggérer des règles avec Cortex AI", type="primary", key="wiz_suggest_rules"):
+                        with st.spinner("Cortex AI analyse la table secondaire..."):
+                            sample_df = _sf_query(f"SELECT * FROM {secondary_fqn} LIMIT 5")
+                            sample_rows = sample_df.to_dict("records") if not sample_df.empty else []
+                            suggestions = suggest_rules_cortex(secondary_fqn, sec_cols, sample_rows)
+                            st.session_state["wizard_ai_suggestions"] = suggestions
+
+                    if "wizard_ai_suggestions" in st.session_state and st.session_state["wizard_ai_suggestions"]:
+                        st.markdown(
+                            f'<div style="font-size:0.85rem;font-weight:600;color:{t["text_primary"]};margin:12px 0 8px;">'
+                            f'Règles suggérées par Cortex AI ({len(st.session_state["wizard_ai_suggestions"])})</div>',
+                            unsafe_allow_html=True,
+                        )
+                        accepted_rules = []
+                        for i, rule in enumerate(st.session_state["wizard_ai_suggestions"]):
+                            col_chk, col_info = st.columns([0.06, 0.94])
+                            with col_chk:
+                                keep = st.checkbox(" ", value=True, key=f"ai_rule_accept_{i}", label_visibility="collapsed")
+                            with col_info:
+                                sev_cls = {"HIGH": "qx-badge-high", "MEDIUM": "qx-badge-medium", "LOW": "qx-badge-low"}.get(rule.get("severity", "MEDIUM"), "")
+                                st.markdown(
+                                    f'<div style="padding:8px 12px;background:{t["border_subtle"]};border-radius:8px;margin-bottom:4px;">'
+                                    f'<span class="qx-badge {sev_cls}" style="margin-right:8px;">{rule.get("severity", "MEDIUM")}</span>'
+                                    f'<strong>{html.escape(rule.get("name", ""))}</strong> — '
+                                    f'<code>{html.escape(rule.get("target_field", ""))}</code> '
+                                    f'<span style="color:{t["text_secondary"]};font-size:0.75rem;">({rule.get("rule_type", "")})</span>'
+                                    f'<div style="font-size:0.72rem;color:{t["text_secondary"]};margin-top:2px;">{html.escape(rule.get("description", ""))}</div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            if keep:
+                                accepted_rules.append(rule)
+                        st.session_state["wizard_ai_rules"] = accepted_rules
+                        if accepted_rules:
+                            st.caption(f"{len(accepted_rules)} règle(s) acceptée(s)")
+                else:
+                    st.warning("Impossible de charger les colonnes des tables.")
+        else:
+            # Clear join config if disabled
+            st.session_state.pop("wizard_join_config", None)
+            st.session_state.pop("wizard_ai_rules", None)
+            st.session_state.pop("wizard_ai_suggestions", None)
+
+        st.markdown("---")
+
+        # --- Import règles métier ---
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<div style="width:24px;height:24px;border-radius:6px;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;">'
+            f'<svg width="12" height="12" fill="none" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" stroke="{accent}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+            f'</div>'
+            f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Importer des r\u00e8gles m\u00e9tier</span>'
+            f'</div>'
+            f'<p style="font-size:0.76rem;color:{t["text_secondary"]};margin:0 0 10px 34px;">Uploadez un document d\u00e9crivant vos r\u00e8gles en langage naturel pour les convertir en r\u00e8gles ex\u00e9cutables.</p>',
+            unsafe_allow_html=True,
+        )
+        rules_file = st.file_uploader(
+            "Document de r\u00e8gles m\u00e9tier",
+            type=["txt", "csv", "pdf", "docx", "md"],
+            key="wizard_rules_file",
+            label_visibility="collapsed",
+        )
+        if rules_file:
+            # Extract text from uploaded file
+            _rules_text = ""
+            try:
+                if rules_file.name.endswith((".txt", ".md", ".csv")):
+                    _rules_text = rules_file.read().decode("utf-8", errors="ignore")
+                elif rules_file.name.endswith(".pdf"):
+                    try:
+                        import pypdf
+                        reader = pypdf.PdfReader(rules_file)
+                        _rules_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                    except ImportError:
+                        st.warning("Module `pypdf` non install\u00e9. Utilisez un fichier .txt ou .csv.")
+                elif rules_file.name.endswith(".docx"):
+                    try:
+                        import docx
+                        doc = docx.Document(rules_file)
+                        _rules_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                    except ImportError:
+                        st.warning("Module `python-docx` non install\u00e9. Utilisez un fichier .txt ou .csv.")
+            except Exception as e:
+                st.error(f"Erreur lecture : {e}")
+
+            if _rules_text:
+                # Truncate to ~4000 chars for Cortex context
+                _rules_text = _rules_text[:4000]
+                st.caption(f"Document charg\u00e9 : **{rules_file.name}** \u00b7 {len(_rules_text)} caract\u00e8res")
+
+                if st.button("Analyser le document", type="primary", key="btn_ai_rules_extract", icon=":material/auto_awesome:"):
+                    with st.spinner("Extraction des r\u00e8gles m\u00e9tier..."):
+                        _fields_list = "siren, siret, vat, company_name, email, phone, address, city, postal_code, country, naf, legal_form, status, website, capital"
+                        _prompt = (
+                            "Tu es un expert en qualit\u00e9 de donn\u00e9es B2B. Analyse le texte suivant et extrais TOUTES les r\u00e8gles de validation de donn\u00e9es.\n\n"
+                            "Pour chaque r\u00e8gle, retourne un objet JSON avec :\n"
+                            "- name: nom court de la r\u00e8gle (en fran\u00e7ais)\n"
+                            f"- field: le champ cible (parmi: {_fields_list})\n"
+                            "- rule_type: type de validation (regex, not_empty, in_list, length)\n"
+                            "- pattern: le pattern (regex pour regex, valeurs s\u00e9par\u00e9es par virgule pour in_list, min:max pour length, vide pour not_empty)\n"
+                            "- severity: HIGH, MEDIUM ou LOW\n"
+                            "- description: explication courte en fran\u00e7ais\n\n"
+                            "Retourne UNIQUEMENT un tableau JSON valide (pas de texte autour, pas de markdown).\n\n"
+                            f"TEXTE :\n{_rules_text}"
+                        )
+                        _prompt_escaped = _prompt.replace("'", "\\'").replace("$$", "$ $")
+                        try:
+                            _result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${_prompt}$$) AS r")
+                            if not _result.empty:
+                                _raw = _result.iloc[0]["r"] if "r" in _result.columns else _result.iloc[0][0]
+                                # Parse JSON from response
+                                _raw = _raw.strip()
+                                # Try to find JSON array in response
+                                _json_start = _raw.find("[")
+                                _json_end = _raw.rfind("]") + 1
+                                if _json_start >= 0 and _json_end > _json_start:
+                                    _json_str = _raw[_json_start:_json_end]
+                                    import json as _json_mod
+                                    _extracted_rules = _json_mod.loads(_json_str)
+                                    st.session_state["ai_extracted_rules"] = _extracted_rules
+                                    st.rerun()
+                                else:
+                                    st.error("L'IA n'a pas retourn\u00e9 un JSON valide. R\u00e9essayez.")
+                            else:
+                                st.error("Pas de r\u00e9ponse de Cortex AI.")
+                        except Exception as e:
+                            st.error(f"Erreur Cortex AI : {e}")
+
+        # --- Display extracted rules: master-detail with toggles ---
+        if "ai_extracted_rules" in st.session_state and st.session_state["ai_extracted_rules"]:
+            _ext_rules = st.session_state["ai_extracted_rules"]
+            _type_labels = {"regex": "FORMAT", "not_empty": "OBLIGATOIRE", "in_list": "LISTE", "length": "LONGUEUR"}
+            _field_to_cat = {
+                "siren": "Identit\u00e9", "siret": "Identit\u00e9", "vat": "Identit\u00e9", "naf": "Identit\u00e9",
+                "legal_form": "Identit\u00e9", "company_name": "Identit\u00e9",
+                "email": "Contact", "phone": "Contact", "website": "Contact",
+                "address": "Localisation", "city": "Localisation", "postal_code": "Localisation", "country": "Localisation",
+                "capital": "Bancaire", "status": "Commercial",
+            }
+
+            # Init active states
+            if "_ai_rule_active" not in st.session_state:
+                st.session_state["_ai_rule_active"] = {i: True for i in range(len(_ext_rules))}
+
+            _n_active = sum(1 for v in st.session_state["_ai_rule_active"].values() if v)
+            _n_high = sum(1 for r in _ext_rules if r.get("severity") == "HIGH")
+            _n_med = sum(1 for r in _ext_rules if r.get("severity") == "MEDIUM")
+            _n_low = len(_ext_rules) - _n_high - _n_med
+
+            # Compact header
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:14px;margin:14px 0 10px;">'
+                f'<span style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};">{len(_ext_rules)} r\u00e8gles</span>'
+                f'<span style="font-size:0.72rem;color:{t["text_secondary"]};">{_n_active} actives</span>'
+                f'<div style="display:flex;gap:0;width:70px;height:5px;border-radius:3px;overflow:hidden;">'
+                f'<div style="flex:{max(_n_high,0.1)};background:#ef4444;"></div>'
+                f'<div style="flex:{max(_n_med,0.1)};background:#f59e0b;"></div>'
+                f'<div style="flex:{max(_n_low,0.1)};background:#94a3b8;"></div></div>'
+                f'<span style="font-size:0.65rem;color:{t["text_secondary"]};">{_n_high} haute \u00b7 {_n_med} moy \u00b7 {_n_low} basse</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Group by category
+            _grouped = {}
+            for idx, rule in enumerate(_ext_rules):
+                cat = _field_to_cat.get(rule.get("field", ""), "Autre")
+                if cat not in _grouped:
+                    _grouped[cat] = []
+                _grouped[cat].append((idx, rule))
+
+            # Master-detail layout
+            col_master, col_detail = st.columns([1.2, 0.8])
+
+            with col_master:
+                for cat_name, cat_items in _grouped.items():
+                    _cat_active = sum(1 for idx, _ in cat_items if st.session_state["_ai_rule_active"].get(idx, True))
+                    with st.expander(f"**{cat_name}** ({len(cat_items)}) \u2014 {_cat_active}/{len(cat_items)} actives", expanded=True):
+                        for idx, rule in cat_items:
+                            _sev_c = "#ef4444" if rule.get("severity") == "HIGH" else ("#f59e0b" if rule.get("severity") == "MEDIUM" else "#94a3b8")
+                            _r_type = _type_labels.get(rule.get("rule_type", ""), rule.get("rule_type", ""))
+                            _is_sel = st.session_state.get("_ai_sel_rule") == idx
+                            col_tog, col_name, col_sel = st.columns([0.12, 0.7, 0.18])
+                            with col_tog:
+                                _active = st.toggle(" ", value=st.session_state["_ai_rule_active"].get(idx, True), key=f"ai_tog_{idx}", label_visibility="collapsed")
+                                st.session_state["_ai_rule_active"][idx] = _active
+                            with col_name:
+                                st.markdown(
+                                    f'<div style="display:flex;align-items:center;gap:8px;padding:4px 0;">'
+                                    f'<span style="width:8px;height:8px;border-radius:50%;background:{_sev_c};flex-shrink:0;"></span>'
+                                    f'<span style="font-size:0.8rem;font-weight:600;color:{t["text_primary"]};{"opacity:0.4;" if not _active else ""}">{html.escape(rule.get("name",""))}</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            with col_sel:
+                                if st.button("\u203a", key=f"ai_sel_{idx}", use_container_width=True):
+                                    st.session_state["_ai_sel_rule"] = idx
+                                    st.rerun()
+
+            with col_detail:
+                _sel_idx = st.session_state.get("_ai_sel_rule", 0)
+                if _sel_idx >= len(_ext_rules):
+                    _sel_idx = 0
+                _sel_rule = _ext_rules[_sel_idx]
+                _sev_colors = {"HIGH": "#ef4444", "MEDIUM": "#f59e0b", "LOW": "#3b82f6"}
+                _sev_label = {"HIGH": "HAUTE PRIORIT\u00c9", "MEDIUM": "MOYENNE PRIORIT\u00c9", "LOW": "BASSE PRIORIT\u00c9"}
+                _sev_c = _sev_colors.get(_sel_rule.get("severity", ""), "#94a3b8")
+                _is_active = st.session_state["_ai_rule_active"].get(_sel_idx, True)
+                _state_label = "ACTIVE" if _is_active else "INACTIVE"
+                _state_color = "#16a34a" if _is_active else "#94a3b8"
+                _field_label = _sel_rule.get("field", "").replace("_", " ").title()
+
+                st.markdown(
+                    f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:12px;padding:22px;">'
+                    f'<span style="font-size:0.58rem;padding:3px 9px;border:1px solid {_sev_c};color:{_sev_c};border-radius:999px;font-weight:700;">{_sev_label.get(_sel_rule.get("severity",""), "")}</span>'
+                    f'<h3 style="font-size:1.05rem;font-weight:700;color:{t["text_primary"]};margin:12px 0 6px;">{html.escape(_sel_rule.get("name", ""))}</h3>'
+                    f'<div style="margin-bottom:12px;">'
+                    f'<code style="font-size:0.65rem;padding:2px 7px;background:{t["border_subtle"]};border-radius:4px;">{html.escape(_sel_rule.get("field", ""))}</code>'
+                    f'<span style="font-size:0.72rem;color:{t["text_secondary"]};margin-left:6px;">\u00b7 {html.escape(_field_label)}</span>'
+                    f'</div>'
+                    f'<p style="font-size:0.8rem;color:{t["text_secondary"]};margin:0 0 14px;">{html.escape(_sel_rule.get("description", ""))}</p>'
+                    f'<div style="background:{t["border_subtle"]};border-radius:8px;padding:9px 12px;margin-bottom:16px;">'
+                    f'<span style="font-size:0.7rem;font-weight:700;color:{t["text_secondary"]};">{_type_labels.get(_sel_rule.get("rule_type",""), "")}</span>'
+                    f'{"  &mdash;  <code style=" + chr(34) + "font-size:0.68rem;" + chr(34) + ">" + html.escape(_sel_rule.get("pattern","")) + "</code>" if _sel_rule.get("pattern") else ""}'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Tester une valeur
+                _test_val = st.text_input("Tester une valeur", placeholder="Saisissez pour contr\u00f4ler", key="ai_rule_tester")
+                if _test_val:
+                    st.caption("Saisissez une valeur pour la contr\u00f4ler contre cette r\u00e8gle.")
+                    _rtype = _sel_rule.get("rule_type", "")
+                    _pattern = _sel_rule.get("pattern", "")
+                    _pass = False
+                    if _rtype == "not_empty":
+                        _pass = bool(_test_val.strip())
+                    elif _rtype == "regex":
+                        try:
+                            _pass = bool(re.search(_pattern or r'.+', _test_val))
+                        except re.error:
+                            _pass = bool(_test_val.strip())
+                    elif _rtype == "in_list":
+                        _allowed = [v.strip().upper() for v in (_pattern or "").split(",") if v.strip()]
+                        _pass = _test_val.strip().upper() in _allowed
+                    elif _rtype == "length":
+                        parts = (_pattern or "0:9999").split(":")
+                        mn = int(parts[0]) if parts[0].isdigit() else 0
+                        mx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 9999
+                        _pass = mn <= len(_test_val) <= mx
+                    else:
+                        _pass = bool(_test_val.strip())
+                    if _pass:
+                        st.success("Conforme")
+                    else:
+                        st.error("Rejet\u00e9")
+
+                # \u00c9tat badge
+                st.markdown(f'<div style="margin-top:14px;font-size:0.75rem;color:{t["text_secondary"]};">\u00c9tat : <span style="padding:3px 10px;border:1px solid {_state_color};color:{_state_color};border-radius:6px;font-weight:600;font-size:0.68rem;">{_state_label}</span></div>', unsafe_allow_html=True)
+
+            # --- Import / Annuler ---
+            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+            col_import, col_clear, _ = st.columns([1, 1, 1])
+            with col_import:
+                _to_import = [i for i, v in st.session_state["_ai_rule_active"].items() if v]
+                if _to_import and st.button(f"Importer {len(_to_import)} r\u00e8gle(s)", type="primary", key="btn_import_ai_rules", use_container_width=True):
+                    _imported = 0
+                    for idx in _to_import:
+                        rule = _ext_rules[idx]
+                        try:
+                            create_custom_rule(
+                                name=rule.get("name", "R\u00e8gle"),
+                                target_field=rule.get("field", "company_name"),
+                                rule_type=rule.get("rule_type", "regex"),
+                                pattern=rule.get("pattern", ""),
+                                severity=rule.get("severity", "MEDIUM"),
+                                description=rule.get("description", ""),
+                            )
+                            _imported += 1
+                        except Exception:
+                            pass
+                    st.session_state.pop("ai_extracted_rules", None)
+                    st.session_state.pop("_ai_rule_active", None)
+                    st.toast(f"\u2713 {_imported} r\u00e8gle(s) import\u00e9e(s)")
+                    st.rerun()
+            with col_clear:
+                if st.button("Annuler", key="btn_clear_ai_rules", use_container_width=True):
+                    st.session_state.pop("ai_extracted_rules", None)
+                    st.session_state.pop("_ai_rule_active", None)
+                    st.rerun()
+
+        st.markdown("---")
+
+        _render_rules_and_dedup_config("wizard")
+
+        for subj in ANALYSIS_SUBJECTS:
+            if subj["id"] in st.session_state["selected_subjects"]:
+                rules = [r for r in RULE_TEMPLATES if r["subject"] == subj["name"]]
+                for r in rules:
+                    card(f'<code>{html.escape(r["id"])}</code> — {html.escape(r["name"])}')
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Retour"):
+                st.session_state["wizard_step"] = 1
+                st.rerun()
+        with c2:
+            if st.button("Suivant : Data Cleaning", type="primary"):
+                st.session_state["wizard_step"] = 3
+                st.rerun()
+
+    elif step == 3:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Étape 3 — Nettoyage & Dédoublonnage</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        t = get_theme()
+        # Resolve source name: prefer uploaded file name, then wizard table, avoid DIM_ACCOUNT fallback
+        _wiz_source = st.session_state.get("wizard_source", "")
+        _wiz_fname = st.session_state.get("wizard_file_upload", "")
+        _wiz_table = st.session_state.get("import_wizard_table", "")
+        if _wiz_source == "file" and _wiz_fname:
+            table_fqn = _wiz_fname
+        elif _wiz_table:
+            table_fqn = _wiz_table
+        else:
+            table_fqn = _dim_account_fqn()
+        # Use uploaded/loaded df from wizard if available
+        if "wizard_uploaded_df" in st.session_state and st.session_state["wizard_uploaded_df"] is not None and not st.session_state["wizard_uploaded_df"].empty:
+            df = st.session_state["wizard_uploaded_df"]
+        elif "uploaded_df" in st.session_state and not st.session_state["uploaded_df"].empty:
+            df = st.session_state["uploaded_df"]
+        else:
+            # Load from Snowflake table
+            load_dim_account.clear()
+            raw_data = load_dim_account(table_fqn)
+            df = pd.DataFrame(raw_data) if raw_data else pd.DataFrame()
+        mapping = _mapping_for_table(table_fqn, list(df.columns)) if not df.empty else {}
+
+        # --- 3 Phase cards (matching screenshot) ---
+        st.markdown(
+            f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:18px;">'
+            # Phase 1
+            f'<div style="background:{t["card_bg"]};border:1px solid #059669;border-radius:12px;padding:18px 20px;">'
+            f'<div style="width:30px;height:30px;border-radius:50%;background:#059669;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.85rem;margin-bottom:10px;">1</div>'
+            f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:4px;">Doublons parfaits</div>'
+            f'<div style="font-size:0.72rem;color:{t["text_secondary"]};">Lignes strictement identiques après normalisation (espaces, casse).</div></div>'
+            # Phase 2
+            f'<div style="background:{t["card_bg"]};border:1px solid #d97706;border-radius:12px;padding:18px 20px;">'
+            f'<div style="width:30px;height:30px;border-radius:50%;background:#d97706;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.85rem;margin-bottom:10px;">2</div>'
+            f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:4px;">Détection des erreurs</div>'
+            f'<div style="font-size:0.72rem;color:{t["text_secondary"]};">Valeurs aberrantes, mal formatées ou fautes de frappe, avec proposition de nettoyage.</div></div>'
+            # Phase 3
+            f'<div style="background:{t["card_bg"]};border:1px solid #7c3aed;border-radius:12px;padding:18px 20px;">'
+            f'<div style="width:30px;height:30px;border-radius:50%;background:#7c3aed;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.85rem;margin-bottom:10px;">3</div>'
+            f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:4px;">Similarité</div>'
+            f'<div style="font-size:0.72rem;color:{t["text_secondary"]};">Calcul de proximité entre lignes ; au-dessus du seuil = doublon potentiel.</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # --- Table info bar ---
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:12px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;">'
+            f'<div style="display:flex;align-items:center;gap:12px;">'
+            f'<div style="width:36px;height:36px;border-radius:8px;background:{t["border_subtle"]};display:flex;align-items:center;justify-content:center;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{t["text_secondary"]}" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div>'
+            f'<div>'
+            f'<div style="font-family:monospace;font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">{table_fqn}</div>'
+            f'<div style="display:flex;align-items:center;gap:5px;margin-top:3px;">'
+            f'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>'
+            f'<span style="font-size:0.7rem;color:{t["text_secondary"]};">Table originale jamais modifiée - backup automatique</span></div></div></div>'
+            f'<div style="text-align:right;">'
+            f'<div style="font-size:1.4rem;font-weight:800;color:{t["text_primary"]};">{len(df)}</div>'
+            f'<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.05em;color:{t["text_secondary"]};">Lignes</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        if df.empty:
+            st.warning("Aucune donnée à traiter.")
+        else:
+            # Initialize pipeline state: ready → phase1 → phase2 → phase3 → done
+            if "dedup_pipeline_state" not in st.session_state:
+                st.session_state["dedup_pipeline_state"] = "ready"
+
+            pipeline_state = st.session_state["dedup_pipeline_state"]
+
+            # --- Phase progress indicator ---
+            _phase_labels = ["Configuration", "Doublons exacts", "Corrections", "Similarité"]
+            _phase_map = {"ready": 0, "phase1": 1, "phase2": 2, "phase3": 3, "done": 4}
+            _current_phase_idx = _phase_map.get(pipeline_state, 0)
+            _progress_html = '<div style="display:flex;align-items:center;gap:6px;margin-bottom:18px;">'
+            for _pi, _pl in enumerate(_phase_labels):
+                if _pi < _current_phase_idx:
+                    _bg = "#059669"; _fg = "#fff"; _border = "#059669"
+                elif _pi == _current_phase_idx:
+                    _bg = accent; _fg = "#fff"; _border = accent
+                else:
+                    _bg = t["card_bg"]; _fg = t["text_secondary"]; _border = t["border"]
+                _progress_html += (
+                    f'<div style="display:flex;align-items:center;gap:6px;">'
+                    f'<div style="width:26px;height:26px;border-radius:50%;background:{_bg};color:{_fg};border:1px solid {_border};'
+                    f'display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;">{_pi+1}</div>'
+                    f'<span style="font-size:0.75rem;color:{_fg if _pi <= _current_phase_idx else t["text_secondary"]};font-weight:{"700" if _pi == _current_phase_idx else "400"};">{_pl}</span>'
+                )
+                if _pi < len(_phase_labels) - 1:
+                    _line_color = "#059669" if _pi < _current_phase_idx else t["border"]
+                    _progress_html += f'<div style="width:30px;height:2px;background:{_line_color};margin:0 4px;"></div>'
+                _progress_html += '</div>'
+            _progress_html += '</div>'
+            st.markdown(_progress_html, unsafe_allow_html=True)
+
+            if pipeline_state == "ready":
+                all_cols = list(df.columns)
+                default_cols = [c for c in all_cols if any(k in c.lower() for k in ("name", "nom", "siren", "company", "raison")) and "siret" not in c.lower()]
+                if not default_cols:
+                    default_cols = all_cols[:3]
+                compare_cols = st.multiselect("Colonnes pour la détection", all_cols, default=default_cols, key="dedup_compare_cols")
+
+                if st.button("Démarrer le nettoyage", type="primary", key="dedup_start", use_container_width=True):
+                    with st.spinner("Création du backup..."):
+                        _dedup_create_backup(df, table_fqn)
+                        st.session_state["dedup_compare_cols_saved"] = compare_cols or all_cols
+                        st.session_state["dedup_pipeline_state"] = "phase1"
+                    st.rerun()
+
+            elif pipeline_state == "phase1":
+                st.markdown(
+                    f'<div style="font-size:0.92rem;font-weight:700;color:#059669;margin-bottom:12px;">'
+                    f'Phase 1 — Doublons parfaits</div>',
+                    unsafe_allow_html=True,
+                )
+                compare_cols = st.session_state.get("dedup_compare_cols_saved", list(df.columns)[:3])
+                if "dedup_exact_groups" not in st.session_state:
+                    with st.spinner("Recherche des doublons exacts..."):
+                        _, exact_groups = _dedup_phase1_exact(df, compare_cols)
+                        st.session_state["dedup_exact_groups"] = exact_groups
+                    st.rerun()
+
+                exact_groups = st.session_state.get("dedup_exact_groups", [])
+                if exact_groups:
+                    st.info(f"**{len(exact_groups)} groupe(s)** de doublons exacts trouvés.")
+                    _display_cols = [c for c in df.columns if c.lower() not in ("account_id", "id")][:6]
+                    _exact_table_data = []
+                    for i, grp in enumerate(exact_groups):
+                        for j, idx in enumerate(grp.get("indices", [])):
+                            if idx < len(df):
+                                _row = df.iloc[idx]
+                                _exact_table_data.append({
+                                    "Supprimer": j > 0,
+                                    "Groupe": f"E{i+1}",
+                                    "Action": "Garder" if j == 0 else "Fusionner",
+                                    **{c: str(_row.get(c, ""))[:50] for c in _display_cols},
+                                })
+                    if _exact_table_data:
+                        _exact_df = pd.DataFrame(_exact_table_data)
+                        st.data_editor(
+                            _exact_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Supprimer": st.column_config.CheckboxColumn("Suppr.", width="small"),
+                                "Groupe": st.column_config.TextColumn("Groupe", width="small"),
+                                "Action": st.column_config.TextColumn("Action", width="small"),
+                            },
+                            disabled=[c for c in _exact_df.columns if c != "Supprimer"],
+                            key="dedup_exact_editor",
+                            num_rows="fixed",
+                        )
+                else:
+                    st.success("Aucun doublon exact trouvé.")
+
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button("Ignorer  ›", key="phase1_skip", use_container_width=True):
+                        st.session_state["dedup_phase1_applied"] = False
+                        st.session_state["dedup_pipeline_state"] = "phase2"
+                        st.rerun()
+                with _c2:
+                    if st.button("Appliquer  ›", type="primary", key="phase1_apply", use_container_width=True):
+                        st.session_state["dedup_phase1_applied"] = True
+                        st.session_state["dedup_pipeline_state"] = "phase2"
+                        st.rerun()
+
+            elif pipeline_state == "phase2":
+                st.markdown(
+                    f'<div style="font-size:0.92rem;font-weight:700;color:#d97706;margin-bottom:12px;">'
+                    f'Phase 2 — Détection des erreurs de formatage</div>',
+                    unsafe_allow_html=True,
+                )
+                if "dedup_corrections" not in st.session_state:
+                    with st.spinner("Détection des erreurs de formatage..."):
+                        df_cleaned, corrections = _dedup_phase2_errors(df, mapping)
+                        st.session_state["dedup_corrections"] = corrections
+                        st.session_state["dedup_cleaned_df"] = df_cleaned
+                    st.rerun()
+
+                corrections = st.session_state.get("dedup_corrections", [])
+                if corrections:
+                    st.info(f"**{len(corrections)} correction(s)** proposées.")
+                    for corr in corrections:
+                        st.markdown(
+                            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:10px;padding:14px 18px;margin-bottom:8px;display:flex;align-items:center;gap:12px;">'
+                            f'<div style="width:28px;height:28px;border-radius:8px;background:rgba(217,119,6,0.1);display:flex;align-items:center;justify-content:center;">'
+                            f'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></div>'
+                            f'<div><div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">{html.escape(corr["desc"])}</div>'
+                            f'<div style="font-size:0.72rem;color:{t["text_secondary"]};">Colonne <code>{html.escape(corr.get("col", ""))}</code> \u00b7 {corr["count"]} lignes</div></div></div>',
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.success("Aucune erreur de formatage d\u00e9tect\u00e9e.")
+
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button("Ignorer  \u203a", key="phase2_skip", use_container_width=True):
+                        st.session_state["dedup_phase2_applied"] = False
+                        st.session_state["dedup_pipeline_state"] = "phase3"
+                        st.rerun()
+                with _c2:
+                    if st.button("Appliquer  \u203a", type="primary", key="phase2_apply", use_container_width=True):
+                        st.session_state["dedup_phase2_applied"] = True
+                        st.session_state["dedup_pipeline_state"] = "phase3"
+                        st.rerun()
+
+            elif pipeline_state == "phase3":
+                st.markdown(
+                    f'<div style="font-size:0.92rem;font-weight:700;color:#7c3aed;margin-bottom:12px;">'
+                    f'Phase 3 \u2014 Similarit\u00e9</div>',
+                    unsafe_allow_html=True,
+                )
+                compare_cols = st.session_state.get("dedup_compare_cols_saved", list(df.columns)[:3])
+                if "dedup_sim_groups" not in st.session_state:
+                    with st.spinner("Calcul de similarit\u00e9..."):
+                        _work_df = st.session_state.get("dedup_cleaned_df", df) if st.session_state.get("dedup_phase2_applied") else df
+                        _phase1_indices = set()
+                        if st.session_state.get("dedup_phase1_applied"):
+                            for _g in st.session_state.get("dedup_exact_groups", []):
+                                _phase1_indices.update(_g.get("indices", []))
+                        sim_groups = _dedup_phase3_similarity(_work_df, compare_cols, threshold=0.85, exclude_indices=_phase1_indices)
+                        st.session_state["dedup_sim_groups"] = sim_groups
+                    st.rerun()
+
+                sim_groups = st.session_state.get("dedup_sim_groups", [])
+                if sim_groups:
+                    _confirmed = [g for g in sim_groups if g.get("verdict") == "CONFIRME"]
+                    _to_verify = [g for g in sim_groups if g.get("verdict") == "A_VERIFIER"]
+
+                    st.markdown(
+                        f'<div style="display:flex;gap:10px;margin-bottom:16px;">'
+                        f'<span style="padding:5px 14px;border-radius:8px;background:rgba(5,150,105,0.1);color:#059669;font-size:0.78rem;font-weight:700;">{len(_confirmed)} confirm\u00e9s</span>'
+                        f'<span style="padding:5px 14px;border-radius:8px;background:rgba(245,158,11,0.1);color:#f59e0b;font-size:0.78rem;font-weight:700;">{len(_to_verify)} \u00e0 v\u00e9rifier</span>'
+                        f'<span style="padding:5px 14px;border-radius:8px;background:{t["border_subtle"]};color:{t["text_secondary"]};font-size:0.78rem;font-weight:600;">{len(sim_groups)} groupes</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    _sim_table_data = []
+                    for i, grp in enumerate(sim_groups):
+                        _verdict = grp.get("verdict", "A_VERIFIER")
+                        _sim = grp.get("similarity", 0)
+                        _names = grp.get("names", ["", ""])
+                        _cities = grp.get("cities", ["", ""])
+                        _reason = grp.get("reason", "")
+                        _sim_table_data.append({
+                            "Fusionner": _verdict == "CONFIRME",
+                            "Groupe": f"S{i+1}",
+                            "Verdict": "Confirm\u00e9" if _verdict == "CONFIRME" else "\u00c0 v\u00e9rifier",
+                            "Nom A": _names[0] if _names else "",
+                            "Nom B": _names[1] if len(_names) > 1 else "",
+                            "Ville A": _cities[0] if _cities else "",
+                            "Ville B": _cities[1] if len(_cities) > 1 else "",
+                            "Similarit\u00e9": f"{_sim}%",
+                            "Raison": _reason,
+                        })
+
+                    if _sim_table_data:
+                        _sim_df = pd.DataFrame(_sim_table_data)
+                        _edited_sim = st.data_editor(
+                            _sim_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Fusionner": st.column_config.CheckboxColumn("Fusionner", width="small"),
+                                "Groupe": st.column_config.TextColumn("Groupe", width="small"),
+                                "Verdict": st.column_config.TextColumn("Verdict", width="small"),
+                                "Nom A": st.column_config.TextColumn("Nom A", width="medium"),
+                                "Nom B": st.column_config.TextColumn("Nom B", width="medium"),
+                                "Ville A": st.column_config.TextColumn("Ville A", width="small"),
+                                "Ville B": st.column_config.TextColumn("Ville B", width="small"),
+                                "Similarit\u00e9": st.column_config.TextColumn("Sim.", width="small"),
+                                "Raison": st.column_config.TextColumn("Raison", width="medium"),
+                            },
+                            disabled=[c for c in _sim_df.columns if c != "Fusionner"],
+                            key="dedup_sim_editor",
+                            num_rows="fixed",
+                        )
+                        for i, row in _edited_sim.iterrows():
+                            st.session_state[f"dedup_decision_{i}"] = "merge" if row["Fusionner"] else "keep"
+                else:
+                    st.success("Aucun doublon par similarit\u00e9 trouv\u00e9.")
+
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    if st.button("Ignorer", key="phase3_skip", use_container_width=True):
+                        st.session_state["dedup_phase3_applied"] = False
+                        _finalize_dedup_pipeline(df, mapping, table_fqn, t)
+                        st.rerun()
+                with _c2:
+                    if st.button("Lancer l\u2019ex\u00e9cution  \u203a", type="primary", key="phase3_apply", use_container_width=True):
+                        st.session_state["dedup_phase3_applied"] = True
+                        _accepted_sim = []
+                        for i, grp in enumerate(sim_groups):
+                            if grp.get("verdict") == "CONFIRME":
+                                _accepted_sim.append(grp)
+                            elif grp.get("verdict") == "A_VERIFIER":
+                                if st.session_state.get(f"dedup_decision_{i}") == "merge":
+                                    _accepted_sim.append(grp)
+                        st.session_state["dedup_accepted_sim"] = _accepted_sim
+                        _finalize_dedup_pipeline(df, mapping, table_fqn, t)
+                        st.rerun()
+            elif pipeline_state == "done":
+                df_cleaned = st.session_state.get("wiz_clean_df", df)
+                removed = st.session_state.get("wiz_removed_count", 0)
+                backup_name = st.session_state.get("dedup_backup_name", "")
+
+                if removed > 0:
+                    st.success(f"**{removed} doublon(s)** supprimés. Données de travail : **{len(df_cleaned)} lignes**.")
+                else:
+                    st.info("Aucune modification appliquée. Données prêtes.")
+
+                if backup_name:
+                    st.caption(f"Backup sauvegardé : `QUALITY_TEST.DATA_QUALITY.{backup_name}`")
+
+                with st.expander("Aperçu données de travail", expanded=False):
+                    st.dataframe(df_cleaned.head(20), use_container_width=True, hide_index=True)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Recommencer", key="dedup_restart"):
+                        for _k in ["dedup_pipeline_state", "dedup_exact_groups", "dedup_corrections",
+                                    "dedup_cleaned_df", "dedup_sim_groups", "dedup_phase1_applied",
+                                    "dedup_phase2_applied", "dedup_phase3_applied", "dedup_accepted_sim",
+                                    "dedup_compare_cols_saved"]:
+                            st.session_state.pop(_k, None)
+                        st.session_state["dedup_pipeline_state"] = "ready"
+                        st.rerun()
+                with c2:
+                    if st.button("Lancer l'analyse des règles", type="primary", key="wiz_to_exec"):
+                        st.session_state["wizard_step"] = 4
+                        st.rerun()
+
+    elif step == 4:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
+            f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Étape 4 — Exécution de l\'analyse</span>'
+            f'</div>'
+            f'<div style="font-size:0.78rem;color:{t["text_secondary"]};margin-bottom:18px;margin-left:13px;">Le moteur applique les règles sur Snowflake. Ne fermez pas cette fenêtre.</div>',
+            unsafe_allow_html=True,
+        )
+
+        # --- Pipeline execution placeholder ---
+        pipeline_placeholder = st.empty()
+        rules_placeholder = st.empty()
+
+        import time
+        selected = st.session_state.get("selected_subjects", ["compliance", "duplicates"])
+        table_fqn = st.session_state.get("import_wizard_table", _dim_account_fqn())
+        extra_table = st.session_state.get("wizard_extra_table", "— Aucune —")
+        enabled_rules = st.session_state.get("wizard_enabled_rules", [r["id"] for r in FR_BUSINESS_RULES] + ["INSEE"])
+        dedup_keys = st.session_state.get("wizard_dedup_keys", DEFAULT_DEDUP_KEYS)
+        auto_dedup = st.session_state.get("wizard_auto_dedup", True)
+        dedup_strategy = st.session_state.get("wizard_dedup_strategy", "keep_first")
+        custom_rules = [
+            {"id": r["id"], "name": r["name"], "field": r["target_field"],
+             "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+             "rule_type": r.get("rule_type", "regex")}
+            for r in list_custom_rules(active_only=True)
+        ]
+
+        # Merge AI-suggested rules
+        ai_rules = [
+            {"id": f"AI-{i+1:02d}", "name": r.get("name", ""), "field": r.get("target_field", ""),
+             "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+             "rule_type": r.get("rule_type", "regex")}
+            for i, r in enumerate(st.session_state.get("wizard_ai_rules", []))
+        ]
+        all_custom_rules = custom_rules + ai_rules
+
+        # Join config
+        join_config = st.session_state.get("wizard_join_config") if st.session_state.get("wizard_join_enabled") else None
+
+        # Determine the df to analyze: cleaned from dedup > uploaded file > Snowflake table
+        # IMPORTANT: wiz_clean_df has priority (it's the result AFTER deduplication)
+        _df_override = None
+        _source_label = table_fqn
+        if "wiz_clean_df" in st.session_state and st.session_state.get("wiz_clean_df") is not None and not st.session_state.get("wiz_clean_df", pd.DataFrame()).empty:
+            _df_override = st.session_state["wiz_clean_df"]
+            _source_label = st.session_state.get("wizard_file_upload", table_fqn)
+        elif "wizard_uploaded_df" in st.session_state and st.session_state["wizard_uploaded_df"] is not None and not st.session_state["wizard_uploaded_df"].empty:
+            _df_override = st.session_state["wizard_uploaded_df"]
+            _source_label = st.session_state.get("wizard_file_upload", table_fqn)
+        elif st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state:
+            _df_override = st.session_state["uploaded_df"]
+            _source_label = st.session_state.get("uploaded_filename", "fichier")
+
+        tables_to_run = [table_fqn]
+        if extra_table and extra_table != "— Aucune —":
+            tables_to_run.append(extra_table)
+
+        # Pipeline steps definition
+        _pipeline_steps = [
+            ("Connexion Snowflake", f"Warehouse {st.session_state.get('sf_warehouse', 'COMPUTE_WH')}"),
+            ("Chargement de la table", ""),
+            ("Application des règles R01-R08", ""),
+            ("Enrichissement INSEE", "Vérification vs référentiel Sirene..."),
+            ("Consolidation & scoring", ""),
+        ]
+
+        def _render_pipeline(step_idx, durations):
+            items_html = ""
+            for i, (label, sub) in enumerate(_pipeline_steps):
+                if i < step_idx:
+                    icon = f'<div style="width:24px;height:24px;border-radius:50%;background:#059669;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>'
+                    dur_text = f'{durations[i]:.1f}s' if i < len(durations) else ""
+                elif i == step_idx:
+                    icon = f'<div style="width:24px;height:24px;border-radius:50%;border:2px solid {accent};display:flex;align-items:center;justify-content:center;flex-shrink:0;animation:spin 1s linear infinite;"><div style="width:8px;height:8px;border-radius:50%;background:{accent};"></div></div>'
+                    dur_text = ""
+                else:
+                    icon = f'<div style="width:24px;height:24px;border-radius:50%;border:2px solid {t["border"]};flex-shrink:0;"></div>'
+                    dur_text = "—"
+                _sub_text = sub if i == step_idx else (sub if i < step_idx else "En attente")
+                items_html += (
+                    f'<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid {t["border_subtle"]};">'
+                    f'{icon}'
+                    f'<div style="flex:1;"><div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">{label}</div>'
+                    f'<div style="font-size:0.7rem;color:{t["text_secondary"]};">{_sub_text}</div></div>'
+                    f'<div style="font-family:monospace;font-size:0.72rem;color:{t["text_secondary"]};">{dur_text}</div></div>'
+                )
+            return (
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;">'
+                f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+                f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Pipeline</span></div>'
+                f'{items_html}</div>'
+            )
+
+        # Show initial pipeline state
+        _durations = []
+        pipeline_placeholder.markdown(_render_pipeline(0, _durations), unsafe_allow_html=True)
+
+        all_anomalies = []
+        combined_stats = {"total_rows": 0, "anomaly_count": 0, "affected_rows": 0, "clean_rows": 0, "high": 0, "med": 0, "low": 0}
+
+        t0 = time.time()
+
+        # Step 1: Connection
+        _durations.append(time.time() - t0)
+        pipeline_placeholder.markdown(_render_pipeline(1, _durations), unsafe_allow_html=True)
+
+        # Step 2: Load table (use pre-computed mapping from wizard if available)
+        _t1 = time.time()
+        _wizard_mapping = st.session_state.get("wizard_mapping")
+        _durations.append(time.time() - _t1)
+        pipeline_placeholder.markdown(_render_pipeline(2, _durations), unsafe_allow_html=True)
+
+        # Step 3: Execute rules (FAST — skip name search for speed)
+        _t2 = time.time()
+        for tbl in tables_to_run:
+            mapping = _wizard_mapping if _wizard_mapping and tbl == table_fqn else _mapping_for_table(tbl, list(_df_override.columns) if _df_override is not None and tbl == table_fqn else None)
+            anomalies, stats, _, _, _ = run_snowflake_dq_analysis(
+                tbl, mapping, enabled_rules, dedup_keys, auto_dedup, dedup_strategy,
+                all_custom_rules, join_config=join_config if tbl == table_fqn else None,
+                df_override=_df_override if tbl == table_fqn else None,
+                skip_name_search=True,
+            )
+            all_anomalies.extend(anomalies)
+            combined_stats["total_rows"] += stats.get("total_rows", 0)
+            combined_stats["anomaly_count"] += stats.get("anomaly_count", 0)
+            combined_stats["affected_rows"] += stats.get("affected_rows", 0)
+            combined_stats["clean_rows"] += stats.get("clean_rows", 0)
+            combined_stats["high"] += sum(1 for a in anomalies if a.get("severity") == "HIGH")
+            combined_stats["med"] += sum(1 for a in anomalies if a.get("severity") == "MEDIUM")
+            combined_stats["low"] += sum(1 for a in anomalies if a.get("severity") == "LOW")
+        _durations.append(time.time() - _t2)
+        _pipeline_steps[2] = ("Application des règles R01-R08", f"{combined_stats['anomaly_count']} anomalies détectées")
+        pipeline_placeholder.markdown(_render_pipeline(3, _durations), unsafe_allow_html=True)
+
+        # Step 4: INSEE enrichment by name (Cortex Search) — deferred, runs after main analysis
+        _t3 = time.time()
+        # Store info for deferred enrichment on results page (use PRIMARY table mapping)
+        _primary_mapping = _wizard_mapping if _wizard_mapping else _mapping_for_table(table_fqn, list(_df_override.columns) if _df_override is not None else None)
+        st.session_state["_deferred_enrichment"] = {
+            "mapping": _primary_mapping,
+            "enabled_rules": enabled_rules,
+            "df_override": _df_override,
+            "table_fqn": table_fqn,
+            "custom_rules": all_custom_rules,
+        }
+        _durations.append(time.time() - _t3)
+        _pipeline_steps[1] = ("Chargement de la table", f"{combined_stats['total_rows']} lignes après nettoyage")
+        pipeline_placeholder.markdown(_render_pipeline(4, _durations), unsafe_allow_html=True)
+
+        # Step 5: Scoring
+        _t4 = time.time()
+        records = combined_stats["total_rows"] or 1
+        combined_stats["score"] = round(combined_stats["clean_rows"] / records * 100) if records else 0
+        combined_stats["active_rules"] = enabled_rules
+        combined_stats["duration_s"] = round(time.time() - t0, 1)
+        combined_stats["engine"] = "snowflake"
+        _durations.append(time.time() - _t4)
+        pipeline_placeholder.markdown(_render_pipeline(5, _durations), unsafe_allow_html=True)
+
+        st.session_state["wizard_stats"] = combined_stats
+        _store_analysis_results(all_anomalies, combined_stats, _source_label, "snowflake")
+        load_dq_findings.clear()
+        st.session_state["findings"] = load_dq_findings()
+        st.session_state["wizard_step"] = 5
+        st.rerun()
+
+    elif step == 5:
+        # --- Deferred INSEE name enrichment (Cortex Search) — runs AFTER results are shown ---
+        _deferred = st.session_state.pop("_deferred_enrichment", None)
+        if _deferred:
+            _enrich_placeholder = st.empty()
+            _enrich_placeholder.info("Enrichissement INSEE par nom en cours...")
+            try:
+                _df_enrich = _deferred.get("df_override")
+                _map_enrich = _deferred.get("mapping")
+                _rules_enrich = _deferred.get("enabled_rules")
+                _custom_enrich = _deferred.get("custom_rules", [])
+                if _df_enrich is not None and _map_enrich:
+                    # Run ONLY the name search part (full analysis with name search, no format duplication)
+                    _extra_anomalies, _extra_stats = analyze_uploaded_dataframe(
+                        _df_enrich, _map_enrich, source="snowflake",
+                        enabled_rules=_rules_enrich, skip_duplicate_check=True,
+                        custom_rules=_custom_enrich, skip_name_search=False,
+                    )
+                    # Find NEW anomalies (from name-resolved companies not caught in first pass)
+                    _existing_ids = {a["id"] for a in st.session_state.get("fr_upload_anomalies", [])}
+                    _new_findings = [a for a in _extra_anomalies if a["id"] not in _existing_ids]
+                    if _new_findings:
+                        # Merge new findings
+                        st.session_state["fr_upload_anomalies"] = st.session_state.get("fr_upload_anomalies", []) + _new_findings
+                        ws = st.session_state.get("wizard_stats", {})
+                        ws["anomaly_count"] = ws.get("anomaly_count", 0) + len(_new_findings)
+                        st.session_state["wizard_stats"] = ws
+                        # Persist new findings to Snowflake
+                        _batch_size = 50
+                        for _bi in range(0, len(_new_findings), _batch_size):
+                            _batch = _new_findings[_bi:_bi+_batch_size]
+                            _values_parts = []
+                            _params = {}
+                            for _j, a in enumerate(_batch):
+                                _pk = f"enr{_bi}_{_j}"
+                                _values_parts.append(
+                                    f"(%(id_{_pk})s, %(aid_{_pk})s, %(name_{_pk})s, %(sev_{_pk})s, 'Open', 'Compliance', "
+                                    f"%(rid_{_pk})s, %(field_{_pk})s, %(fl_{_pk})s, %(fv_{_pk})s, %(ev_{_pk})s, %(ft_{_pk})s, %(desc_{_pk})s, %(src_{_pk})s)"
+                                )
+                                _params.update({
+                                    f"id_{_pk}": a["id"], f"aid_{_pk}": a.get("account_id", ""),
+                                    f"name_{_pk}": a.get("company_name", ""), f"sev_{_pk}": a.get("severity", "MEDIUM"),
+                                    f"rid_{_pk}": a.get("rule_id", ""), f"field_{_pk}": a.get("field", ""),
+                                    f"fl_{_pk}": a.get("field_label", ""), f"fv_{_pk}": str(a.get("field_value", ""))[:500],
+                                    f"ev_{_pk}": str(a.get("expected_value", ""))[:500], f"ft_{_pk}": a.get("finding_type", ""),
+                                    f"desc_{_pk}": a.get("description", "")[:1000], f"src_{_pk}": _source_label,
+                                })
+                            _values_sql = ",\n".join(_values_parts)
+                            try:
+                                _sf_execute(
+                                    f"INSERT INTO QUALITY_TEST.DATA_QUALITY.DQ_FINDINGS "
+                                    f"(id, account_id, company_name, severity, status, subject, rule_id, "
+                                    f"field, field_label, field_value, expected_value, finding_type, description, source_table) "
+                                    f"VALUES {_values_sql}",
+                                    _params,
+                                )
+                            except Exception:
+                                pass
+                        load_dq_findings.clear()
+                        _enrich_placeholder.success(f"Enrichissement terminé : +{len(_new_findings)} anomalie(s) détectée(s) via nom d'entreprise")
+                    else:
+                        _enrich_placeholder.empty()
+            except Exception:
+                _enrich_placeholder.empty()
+
+        ws = st.session_state.get("wizard_stats", {})
+        total = ws.get("total_rows", len(load_dim_account(_dim_account_fqn())) or 0)
+        n_anom = ws.get("anomaly_count", len(get_all_fr_anomalies()))
+        score = ws.get("score", 0)
+        score_before = ws.get("score_before", score)
+        high = ws.get("high", 0)
+        med = ws.get("med", 0)
+        low = ws.get("low", 0)
+        duration = ws.get("duration_s", 0)
+        engine = ws.get("engine", "snowflake")
+        dedup = ws.get("dedup", {})
+        _initial_rows = dedup.get("original", total + dedup.get("removed", 0))
+        _removed = dedup.get("removed", 0)
+
+        # --- Success banner ---
+        st.markdown(
+            f'<div style="background:linear-gradient(135deg,#ecfdf5,#d1fae5);border:1px solid #a7f3d0;border-radius:16px;padding:24px 30px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;">'
+            f'<div style="display:flex;align-items:center;gap:16px;">'
+            f'<div style="width:44px;height:44px;border-radius:50%;background:#059669;display:flex;align-items:center;justify-content:center;">'
+            f'<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg></div>'
+            f'<div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:#064e3b;">Analyse terminée</div>'
+            f'<div style="font-size:0.8rem;color:#065f46;margin-top:2px;">{total} lignes analysées · {len(ws.get("active_rules", []))} règles appliquées · rapprochement INSEE effectué</div>'
+            f'</div></div>'
+            f'<div style="text-align:right;">'
+            f'<div style="font-size:0.68rem;color:#065f46;text-transform:uppercase;letter-spacing:0.05em;">Durée totale</div>'
+            f'<div style="font-family:monospace;font-size:1.3rem;font-weight:700;color:#064e3b;">{duration}s</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # --- 4 KPI cards ---
+        _score_color = "#059669" if score >= 80 else ("#d97706" if score >= 50 else "#dc2626")
+        st.markdown(
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px;">'
+            # Lignes analysées
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-left:3px solid #2563eb;border-radius:12px;padding:18px 20px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+            f'<span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">Lignes analysées</span>'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></div>'
+            f'<div style="font-size:2rem;font-weight:800;color:{t["text_primary"]};line-height:1;">{total}</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};margin-top:6px;">après nettoyage ({_initial_rows} au départ)</div></div>'
+            # Anomalies
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-left:3px solid #dc2626;border-radius:12px;padding:18px 20px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+            f'<span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">Anomalies</span>'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>'
+            f'<div style="font-size:2rem;font-weight:800;color:#dc2626;line-height:1;">{n_anom}</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};margin-top:6px;"><strong>{high} critiques</strong> à traiter</div></div>'
+            # Doublons supprimés
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-left:3px solid #7c3aed;border-radius:12px;padding:18px 20px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+            f'<span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">Doublons supprimés</span>'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></div>'
+            f'<div style="font-size:2rem;font-weight:800;color:{t["text_primary"]};line-height:1;">{_removed}</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};margin-top:6px;">{dedup.get("exact",0)} exacts · {dedup.get("similar",0)} similarité</div></div>'
+            # Score conformité
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-left:3px solid {_score_color};border-radius:12px;padding:18px 20px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">'
+            f'<span style="font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">Score conformité</span>'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="{_score_color}" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>'
+            f'<div style="font-size:2rem;font-weight:800;color:{t["text_primary"]};line-height:1;">{score}<span style="font-size:1rem;">%</span></div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};margin-top:6px;">objectif 80 %</div></div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # --- Before/After + Severity ---
+        col_ba, col_sev = st.columns(2)
+        with col_ba:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:18px;">'
+                f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+                f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Avant / après nettoyage</span></div>'
+                f'<div style="display:flex;align-items:center;justify-content:center;gap:20px;">'
+                f'<div style="background:{t["border_subtle"]};border-radius:12px;padding:20px 30px;text-align:center;">'
+                f'<div style="font-size:1.8rem;font-weight:800;color:{t["text_primary"]};">{_initial_rows}</div>'
+                f'<div style="font-size:0.7rem;color:{t["text_secondary"]};margin-top:4px;">lignes initiales</div></div>'
+                f'<span style="font-size:1.2rem;color:{t["text_secondary"]};">→</span>'
+                f'<div style="background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.2);border-radius:12px;padding:20px 30px;text-align:center;">'
+                f'<div style="font-size:1.8rem;font-weight:800;color:#059669;">{total}</div>'
+                f'<div style="font-size:0.7rem;color:#065f46;margin-top:4px;">lignes propres</div></div></div>'
+                f'<div style="text-align:center;font-size:0.72rem;color:{t["text_secondary"]};margin-top:14px;">{_removed} doublons retirés · table de backup conservée</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with col_sev:
+            _total_sev = max(high + med + low, 1)
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;">'
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:18px;">'
+                f'<div style="width:3px;height:16px;border-radius:2px;background:{accent};"></div>'
+                f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Anomalies par sévérité</span></div>'
+                # Élevée
+                f'<div style="margin-bottom:14px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">'
+                f'<div style="display:flex;align-items:center;gap:7px;">'
+                f'<span style="width:9px;height:9px;border-radius:50%;background:#ef4444;"></span>'
+                f'<span style="font-size:0.8rem;color:{t["text_primary"]};">Élevée</span></div>'
+                f'<span style="font-size:0.82rem;font-weight:700;color:{t["text_primary"]};">{high}</span></div>'
+                f'<div style="height:7px;border-radius:4px;background:{t["border_subtle"]};">'
+                f'<div style="height:100%;width:{max(round(high/_total_sev*100),1)}%;border-radius:4px;background:linear-gradient(90deg,#ef4444,#f87171);"></div></div></div>'
+                # Moyenne
+                f'<div style="margin-bottom:14px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">'
+                f'<div style="display:flex;align-items:center;gap:7px;">'
+                f'<span style="width:9px;height:9px;border-radius:50%;background:#f59e0b;"></span>'
+                f'<span style="font-size:0.8rem;color:{t["text_primary"]};">Moyenne</span></div>'
+                f'<span style="font-size:0.82rem;font-weight:700;color:{t["text_primary"]};">{med}</span></div>'
+                f'<div style="height:7px;border-radius:4px;background:{t["border_subtle"]};">'
+                f'<div style="height:100%;width:{max(round(med/_total_sev*100),1)}%;border-radius:4px;background:linear-gradient(90deg,#f59e0b,#fbbf24);"></div></div></div>'
+                # Faible
+                f'<div>'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">'
+                f'<div style="display:flex;align-items:center;gap:7px;">'
+                f'<span style="width:9px;height:9px;border-radius:50%;background:#10b981;"></span>'
+                f'<span style="font-size:0.8rem;color:{t["text_primary"]};">Faible</span></div>'
+                f'<span style="font-size:0.82rem;font-weight:700;color:{t["text_primary"]};">{low}</span></div>'
+                f'<div style="height:7px;border-radius:4px;background:{t["border_subtle"]};">'
+                f'<div style="height:100%;width:{max(round(low/_total_sev*100),1)}%;border-radius:4px;background:linear-gradient(90deg,#10b981,#34d399);"></div></div></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        # --- Action cards ---
+        st.markdown(
+            f'<div style="display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr;gap:12px;margin-top:20px;">',
+            unsafe_allow_html=True,
+        )
+        ca1, ca2, ca3, ca4 = st.columns([1.2, 1, 1, 1])
+        with ca1:
+            if st.button(f"Voir les {n_anom} anomalies", type="primary", use_container_width=True, key="res_voir"):
+                st.session_state["page"] = "findings"
+                st.session_state["wizard_step"] = 1
+                st.rerun()
+        with ca2:
+            if st.button("Créer les tâches", use_container_width=True, key="res_taches"):
+                st.session_state["page"] = "tasks"
+                st.session_state["wizard_step"] = 1
+                st.rerun()
+        with ca3:
+            if st.button("Exporter en CSV", use_container_width=True, key="res_export"):
+                st.session_state["page"] = "exports"
+                st.session_state["wizard_step"] = 1
+                st.rerun()
+        with ca4:
+            if st.button("Nouvelle analyse", use_container_width=True, key="res_restart"):
+                st.session_state["wizard_step"] = 1
+                st.rerun()
+
+
+_FINDINGS_PAGE_SIZE = 10
+
+
+def page_findings():
+    t = get_theme()
+    accent = t['accent']
+
+    # Load findings — prefer session anomalies from current analysis
+    findings = get_all_fr_anomalies()
+    if not findings:
+        # Only fall back to session findings, NOT the entire DB
+        findings = st.session_state.get("findings", [])
+
+    # Apply filters from state
+    search = ""
+    sev_filter = "Toutes"
+    status_filter = "Tous"
+
+    # Count by severity/status (before filtering)
+    _total = len(findings)
+    _open_findings = [f for f in findings if f["status"] in ("Open", "In Review")]
+    _high = sum(1 for f in findings if f["severity"] == "HIGH")
+    _med = sum(1 for f in findings if f["severity"] == "MEDIUM")
+    _low = sum(1 for f in findings if f["severity"] == "LOW")
+    _open_count = len(_open_findings)
+
+    # --- Page Header with action buttons ---
+    st.markdown(f'''
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:6px;">
+        <div>
+            <h1 style="font-size:1.75rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px 0;letter-spacing:-0.02em;">Anomalies</h1>
+            <p style="font-size:0.88rem;color:{t["text_secondary"]};margin:0;"><strong style="color:{t["text_primary"]};">{_open_count}</strong> anomalies ouvertes d\u00e9tect\u00e9es sur vos donn\u00e9es clients.</p>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    # --- Search + Filters ---
+    col_s, col_f1, col_f2 = st.columns([2.5, 1, 1])
+    with col_s:
+        search = st.text_input("Rechercher", placeholder="Entreprise, r\u00e8gle, type d\u2019anomalie...", key="findings_search", label_visibility="visible")
+    with col_f1:
+        sev_filter = st.selectbox("S\u00e9v\u00e9rit\u00e9", ["Toutes", "HIGH", "MEDIUM", "LOW"], key="findings_sev_filter")
+    with col_f2:
+        status_filter = st.selectbox("Statut", ["Tous", "Open", "In Review", "Resolved", "Dismissed"], key="findings_status_filter")
+
+    # --- Severity pills ---
+    st.markdown(f'''
+    <div style="display:flex;align-items:center;gap:10px;margin:8px 0 18px;">
+        <span style="display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:20px;border:1.5px solid #ef4444;font-size:0.78rem;font-weight:600;color:#ef4444;">
+            {_high} \u00c9lev\u00e9e</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:20px;border:1.5px solid #f59e0b;font-size:0.78rem;font-weight:600;color:#f59e0b;">
+            {_med} Moyenne</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:20px;border:1.5px solid #0d9488;font-size:0.78rem;font-weight:600;color:#0d9488;">
+            {_low} Faible</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:20px;border:1.5px solid {t["border"]};font-size:0.78rem;font-weight:600;color:{t["text_secondary"]};">
+            {_open_count} Ouvertes</span>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    # --- Quick web verify ---
+    with st.expander("🔍 Vérification web rapide — taper une valeur à vérifier", expanded=False):
+        _qv_col1, _qv_col2, _qv_col3 = st.columns([1, 2, 1])
+        with _qv_col1:
+            _qv_field = st.selectbox("Type de champ", ["SIREN", "SIRET", "TVA", "Raison sociale", "Site web", "Email"], key="qv_field")
+        with _qv_col2:
+            _qv_value = st.text_input("Valeur à vérifier", placeholder="Ex: 831558663, FR53831558663, academie-x.com…", key="qv_value")
+        with _qv_col3:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            if st.button("🔍 Vérifier", type="primary", key="qv_verify_btn", use_container_width=True, disabled=not _qv_value):
+                _qv_finding = {
+                    "company_name": _qv_value,
+                    "field_label": _qv_field,
+                    "field_value": _qv_value,
+                    "expected_value": "",
+                    "rule_id": "MANUAL",
+                    "account_id": "",
+                }
+                with st.spinner(f"Vérification web de {_qv_field} « {_qv_value} »…"):
+                    result = _web_verify_finding(_qv_finding)
+                    st.session_state["web_verify_result"] = result
+                    st.session_state["web_verify_finding_id"] = None
+                st.rerun()
+
+    findings = get_all_fr_anomalies()
+    if sev_filter != "Toutes":
+        findings = [f for f in findings if f.get("severity") == sev_filter]
+    if status_filter != "Tous":
+        findings = [f for f in findings if f.get("status") == status_filter]
+    if search:
+        findings = [f for f in findings if search.lower() in " ".join(str(v).lower() for v in f.values())]
+
+    if not findings:
+        st.info("Aucune anomalie ne correspond aux filtres.")
+        return
+
+    # --- Stats KPI row ---
+    high_c = sum(1 for f in findings if f.get("severity") == "HIGH")
+    med_c = sum(1 for f in findings if f.get("severity") == "MEDIUM")
+    low_c = sum(1 for f in findings if f.get("severity") == "LOW")
+    open_c = sum(1 for f in findings if f.get("status") == "Open")
+
+    st.markdown(
+        f"""<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;">
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#ef4444;"></div>
+                <div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:{t['text_secondary']};font-weight:600;">Élevée</div>
+                <div style="font-size:1.6rem;font-weight:800;color:#ef4444;margin-top:4px;">{high_c}</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#f59e0b;"></div>
+                <div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:{t['text_secondary']};font-weight:600;">Moyenne</div>
+                <div style="font-size:1.6rem;font-weight:800;color:#f59e0b;margin-top:4px;">{med_c}</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#3b82f6;"></div>
+                <div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:{t['text_secondary']};font-weight:600;">Faible</div>
+                <div style="font-size:1.6rem;font-weight:800;color:#3b82f6;margin-top:4px;">{low_c}</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:{accent};"></div>
+                <div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:{t['text_secondary']};font-weight:600;">Ouvertes</div>
+                <div style="font-size:1.6rem;font-weight:800;color:{accent};margin-top:4px;">{open_c}</div>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # --- Select all toggle ---
+    # Rules legend
+    _rule_descriptions = {
+        "R01": ("Format SIREN", "Vérifie que l'identifiant SIREN comporte 9 chiffres valides.", "SIREN", "HIGH"),
+        "R02": ("Format SIRET", "Vérifie que le SIRET comporte 14 chiffres valides.", "SIRET", "HIGH"),
+        "R03": ("Cohérence SIRET", "SIRET = SIREN + 5 caractères NIC.", "SIRET", "MEDIUM"),
+        "R04": ("TVA intracommunautaire", "Format FR + 11 chiffres avec clé de Luhn.", "TVA", "MEDIUM"),
+        "R05": ("Pays FR", "Code pays = FR pour les comptes domestiques.", "Pays", "LOW"),
+        "R06": ("Code NAF/APE", "Format XX.XXZ valide.", "NAF", "LOW"),
+        "R07": ("Forme juridique", "Champ renseigné (SA, SAS, SARL…).", "Juridique", "LOW"),
+        "R08": ("E-facturation", "SIREN + SIRET valides pour PDP.", "SIREN/SIRET", "MEDIUM"),
+        "INSEE": ("Validation INSEE", "Croisement avec le registre SIRENE 29M+ entreprises.", "SIREN", "MEDIUM"),
+        "DUP": ("Doublon", "SIREN en double dans le fichier/table.", "SIREN", "HIGH"),
+    }
+    _active_rules_in_data = sorted({f.get("rule_id", "") for f in findings})
+    _sev_badge_colors = {"HIGH": "#ef4444", "MEDIUM": "#f59e0b", "LOW": "#3b82f6"}
+    _legend_items = ""
+    for _rid in _active_rules_in_data:
+        _info = _rule_descriptions.get(_rid)
+        if _info:
+            _rname, _rdesc, _rfield, _rsev = _info
+            _rc = _sev_badge_colors.get(_rsev, t['accent'])
+            _legend_items += (
+                f'<div style="position:relative;display:inline-flex;align-items:center;gap:6px;margin-right:14px;margin-bottom:6px;cursor:help;" title="{_rid} — {_rname}. {_rdesc}\nChamp : {_rfield} · Sévérité : {_rsev}">'
+                f'<span style="font-size:0.65rem;padding:2px 7px;border-radius:4px;background:{_rc};color:#fff;font-weight:700;">{_rid}</span>'
+                f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{_rname}</span>'
+                f'</div>'
+            )
+    if _legend_items:
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:8px;padding:10px 14px;margin-bottom:12px;">'
+            f'<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:{t["text_secondary"]};font-weight:600;margin-bottom:6px;">Légende des règles · Survoler pour détails</div>'
+            f'<div style="display:flex;flex-wrap:wrap;align-items:center;">{_legend_items}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # --- Action row ---
+    select_all = st.checkbox("Tout s\u00e9lectionner", value=False, key="findings_select_all")
+
+    # --- Resolve company names from source table if stored names look like IDs ---
+    def _looks_like_id(name: str) -> bool:
+        if not name:
+            return True
+        if re.match(r'^[A-Za-z]\d{5,}$', name):
+            return True
+        if re.match(r'^a3[a-zA-Z0-9]{10,}$', name):
+            return True
+        if re.match(r'^(IMP|DB)-\d{4}$', name):
+            return True
+        return False
+
+    _needs_resolve = any(_looks_like_id(f.get("company_name", "")) for f in findings[:200])
+    _name_lookup: dict[str, str] = {}
+    if _needs_resolve:
+        # Query source table and build lookup keyed by row content that may match account_id
+        _src_fqn = _dim_account_fqn()
+        try:
+            _src_df = _sf_query(f"SELECT * FROM {_src_fqn}")
+            if _src_df is not None and len(_src_df) > 0:
+                _src_cols = list(_src_df.columns)
+                _src_mapping = detect_column_mapping(_src_cols)
+                _name_col = _src_mapping.get("company_name")
+                _id_col = _src_mapping.get("account_id")
+                if _name_col and _name_col in _src_df.columns:
+                    for _, row in _src_df.iterrows():
+                        _n = str(row[_name_col] or "").strip()
+                        if _id_col and _id_col in _src_df.columns:
+                            _aid = str(row[_id_col] or "").strip()
+                            if _aid and _n:
+                                _name_lookup[_aid] = _n
+                        if _n:
+                            _name_lookup[_n] = _n
+        except Exception:
+            pass
+
+    def _display_company(f: dict) -> str:
+        name = f.get("company_name", "")
+        if not _looks_like_id(name):
+            return name
+        # Try to resolve via account_id
+        acct = f.get("account_id", "")
+        if acct and acct in _name_lookup:
+            return _name_lookup[acct]
+        # Try name itself as key
+        if name and name in _name_lookup:
+            return _name_lookup[name]
+        return name if name else "—"
+
+    # --- Build table data ---
+    table_data = []
+    for f in findings:
+        table_data.append({
+            "Sélectionner": select_all,
+            "Entreprise": _display_company(f),
+            "Type": f.get("finding_type", ""),
+            "Champ": f.get("field_label", ""),
+            "Valeur": str(f.get("field_value", "") or "—"),
+            "Attendu": str(f.get("expected_value", "")),
+            "Sévérité": f.get("severity", ""),
+            "Statut": f.get("status", ""),
+            "Règle": f.get("rule_id", ""),
+            "_id": f["id"],
+        })
+
+    df_table = pd.DataFrame(table_data)
+
+    # Interactive table with checkbox
+    edited_df = st.data_editor(
+        df_table.drop(columns=["_id"]),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sélectionner": st.column_config.CheckboxColumn("✓", width="small"),
+            "Entreprise": st.column_config.TextColumn("Entreprise", width="medium"),
+            "Type": st.column_config.TextColumn("Anomalie", width="medium"),
+            "Champ": st.column_config.TextColumn("Champ", width="small"),
+            "Valeur": st.column_config.TextColumn("Valeur", width="medium"),
+            "Attendu": st.column_config.TextColumn("Attendu", width="medium"),
+            "Sévérité": st.column_config.TextColumn("Sévérité", width="small"),
+            "Statut": st.column_config.TextColumn("Statut", width="small"),
+            "Règle": st.column_config.TextColumn("Règle", width="small"),
+        },
+        disabled=["Entreprise", "Type", "Champ", "Valeur", "Attendu", "Sévérité", "Statut", "Règle"],
+        key="findings_editor",
+        num_rows="fixed",
+    )
+
+    # Get selected IDs — if "Tout sélectionner" is on, use ALL findings (not just visible page)
+    if select_all:
+        selected_ids = [f["id"] for f in findings]
+    else:
+        selected_mask = edited_df["Sélectionner"].tolist()
+        selected_ids = [df_table.iloc[i]["_id"] for i, sel in enumerate(selected_mask) if sel]
+
+    # --- Action bar ---
+    st.markdown(f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};margin:12px 0 8px;">{len(selected_ids)} sélectionnée(s) sur {len(findings)}</div>', unsafe_allow_html=True)
+
+    act1, act2, act3, act4, act5 = st.columns(5)
+    with act1:
+        _n_sel = len(selected_ids)
+        _btn_label = f"Corriger tout ({_n_sel})" if _n_sel > 0 else "Corriger (INSEE)"
+        if st.button(_btn_label, type="primary", key="find_bulk_fix", use_container_width=True, disabled=not selected_ids):
+            st.session_state.pop("findings_corrections", None)
+            with st.spinner(f"Correction via INSEE ({_n_sel} anomalies)..."):
+                corrections = []
+                _all_anomalies = get_all_fr_anomalies()
+                _anomaly_lookup = {a["id"]: a for a in _all_anomalies}
+                for fid in selected_ids:
+                    f = _anomaly_lookup.get(fid)
+                    if not f:
+                        continue
+                    corr = _auto_correct_finding(f)
+                    if corr:
+                        corrections.append({"id": fid, "company": f["company_name"], "field": f.get("field_label", ""), "old": _safe_display(f.get("field_value", "")), "new": corr})
+                if corrections:
+                    st.session_state["findings_corrections"] = corrections
+                    st.session_state["findings_corrections_all_ids"] = selected_ids
+                else:
+                    st.session_state["findings_corrections_empty"] = True
+            st.rerun()
+    with act2:
+        if st.button("🔍 Vérifier web (1)", key="find_web_verify", use_container_width=True, disabled=not selected_ids):
+            _target_id = selected_ids[0]
+            _target_f = next((x for x in get_all_fr_anomalies() if x["id"] == _target_id), None)
+            if _target_f:
+                with st.spinner("Vérification web en cours… scan des sources"):
+                    result = _web_verify_finding(_target_f)
+                    st.session_state["web_verify_result"] = result
+                    st.session_state["web_verify_finding_id"] = _target_id
+                st.rerun()
+    with act3:
+        if st.button("En revue", key="find_bulk_review", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Mise à jour de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "In Review")
+            add_audit_entry("Anomalies en revue", f"{len(selected_ids)} → En revue")
+            st.rerun()
+    with act4:
+        if st.button("Résoudre", key="find_bulk_resolve", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Résolution de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "Resolved")
+            add_audit_entry("Anomalies résolues", f"{len(selected_ids)} → Résolu")
+            st.rerun()
+    with act5:
+        if st.button("Rejeter", key="find_bulk_reject", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Rejet de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "Dismissed")
+            add_audit_entry("Anomalies rejetées", f"{len(selected_ids)} → Rejeté")
+            st.rerun()
+
+    # --- Corrections preview ---
+    if st.session_state.get("findings_corrections"):
+        st.markdown("---")
+        corrs = st.session_state["findings_corrections"]
+        _all_selected = st.session_state.get("findings_corrections_all_ids", [])
+        _n_no_corr = len(_all_selected) - len(corrs)
+        st.markdown(
+            f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:4px;">'
+            f'Corrections INSEE — {len(corrs)} corrections trouvées</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-bottom:10px;">'
+            f'Cliquez sur Appliquer pour résoudre les {len(_all_selected)} anomalies sélectionnées en 1 clic.</div>',
+            unsafe_allow_html=True,
+        )
+        corr_df = pd.DataFrame([{"Entreprise": c["company"], "Champ": c["field"], "Ancien": c["old"], "Nouveau (INSEE)": c["new"]} for c in corrs])
+        st.dataframe(corr_df, use_container_width=True, hide_index=True)
+        col_v, col_r = st.columns(2)
+        with col_v:
+            if st.button(f"Appliquer et résoudre tout ({len(_all_selected)})", type="primary", key="find_apply_corr", use_container_width=True):
+                with st.spinner(f"Résolution de {len(_all_selected)} anomalies..."):
+                    update_findings_status_batch(_all_selected, "Resolved")
+                    add_audit_entry("Corrections INSEE", f"{len(corrs)} corrigées, {len(_all_selected)} résolues")
+                st.session_state.pop("findings_corrections", None)
+                st.session_state.pop("findings_corrections_all_ids", None)
+                st.rerun()
+        with col_r:
+            if st.button("Annuler", key="find_cancel_corr", use_container_width=True):
+                st.session_state.pop("findings_corrections", None)
+                st.session_state.pop("findings_corrections_all_ids", None)
+                st.rerun()
+    elif st.session_state.pop("findings_corrections_empty", False):
+        st.info("Aucune correction automatique trouvée pour la sélection (entreprise étrangère ou pas de référence INSEE disponible).")
+
+    # --- Web Verification Result Panel ---
+    # Clear result if the selected finding changed
+    _prev_verify_id = st.session_state.get("web_verify_finding_id")
+    _current_sel = selected_ids[0] if selected_ids else None
+    if _prev_verify_id and _current_sel and _prev_verify_id != _current_sel:
+        st.session_state.pop("web_verify_result", None)
+        st.session_state.pop("web_verify_finding_id", None)
+    if st.session_state.get("web_verify_result"):
+        st.markdown("---")
+        vr = st.session_state["web_verify_result"]
+        _vr_verdict = vr.get("verdict", "incertain")
+        _vr_conf = vr.get("confidence", 0)
+        _vr_expl = vr.get("explanation", "")
+        _vr_suggested = vr.get("suggested_value")
+        _vr_action = vr.get("suggested_action", "")
+
+        # Verdict colors
+        if _vr_verdict == "coherent":
+            _v_color = "#0d9488"
+            _v_bg = "rgba(13,148,136,0.08)"
+            _v_label = "Cohérent — donnée correcte"
+            _v_icon = "✓"
+        elif _vr_verdict == "incoherent":
+            _v_color = "#dc2626"
+            _v_bg = "rgba(220,38,38,0.06)"
+            _v_label = "Incohérent — erreur probable"
+            _v_icon = "✕"
+        else:
+            _v_color = "#f59e0b"
+            _v_bg = "rgba(245,158,11,0.08)"
+            _v_label = "Incertain — vérification manuelle"
+            _v_icon = "?"
+
+        # Confidence bar color
+        _conf_color = "#0d9488" if _vr_conf >= 70 else "#f59e0b" if _vr_conf >= 40 else "#dc2626"
+
+        # Sources badges with clickable URLs
+        _src_html = ""
+        _src_urls = vr.get("source_urls", [])
+        for i, s in enumerate(vr.get("sources", [])):
+            _url = _src_urls[i] if i < len(_src_urls) else ""
+            if _url:
+                _src_html += f'<a href="{html.escape(_url)}" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:{t["border_subtle"]};border-radius:6px;font-size:0.7rem;font-weight:500;color:{t["text_primary"]};">🌐 {html.escape(s)} ↗</a> '
+            else:
+                _src_html += f'<span style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:{t["border_subtle"]};border-radius:6px;font-size:0.7rem;font-weight:500;color:{t["text_primary"]};">🌐 {html.escape(s)}</span> '
+        # Always add direct links to official sources if we have a SIREN/SIRET
+        _vr_val = str(vr.get("field_value", "")).strip()
+        _vr_siren = ""
+        if _vr_val and _vr_val.isdigit():
+            if len(_vr_val) == 9:
+                _vr_siren = _vr_val
+            elif len(_vr_val) == 14:
+                _vr_siren = _vr_val[:9]
+        if _vr_siren and "pappers" not in _src_html.lower():
+            _src_html += f'<a href="https://www.pappers.fr/entreprise/{_vr_siren}" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:rgba(13,148,136,0.08);border:1px solid rgba(13,148,136,0.2);border-radius:6px;font-size:0.7rem;font-weight:600;color:#0d9488;">Pappers.fr ↗</a> '
+            _src_html += f'<a href="https://www.societe.com/societe/-{_vr_siren}.html" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:rgba(13,148,136,0.08);border:1px solid rgba(13,148,136,0.2);border-radius:6px;font-size:0.7rem;font-weight:600;color:#0d9488;">Societe.com ↗</a> '
+            _src_html += f'<a href="https://annuaire-entreprises.data.gouv.fr/entreprise/{_vr_siren}" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;background:rgba(13,148,136,0.08);border:1px solid rgba(13,148,136,0.2);border-radius:6px;font-size:0.7rem;font-weight:600;color:#0d9488;">Annuaire Entreprises ↗</a> '
+
+        # Company info card (if found)
+        _ci = vr.get("company_info", {})
+        _ci_html = ""
+        if _ci and _ci.get("denomination"):
+            _ci_html = (
+                f'<div style="background:rgba(13,148,136,0.04);border:1px solid rgba(13,148,136,0.2);border-radius:10px;padding:16px 18px;margin-bottom:14px;">'
+                f'<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};font-weight:600;margin-bottom:10px;">Fiche entreprise (source web)</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:0.78rem;">'
+                f'<div><span style="color:{t["text_secondary"]};">Raison sociale</span><br/><strong>{html.escape(_ci.get("denomination", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">SIREN</span><br/><strong>{html.escape(_ci.get("siren", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">SIRET siège</span><br/><strong>{html.escape(_ci.get("siret_siege", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Forme juridique</span><br/><strong>{html.escape(_ci.get("forme_juridique", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Adresse</span><br/><strong>{html.escape(_ci.get("adresse", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Code NAF</span><br/><strong>{html.escape(_ci.get("naf", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Statut</span><br/><strong style="color:{"#059669" if _ci.get("statut") == "Active" else "#dc2626"};">{html.escape(_ci.get("statut", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Création</span><br/><strong>{html.escape(_ci.get("date_creation", ""))}</strong></div>'
+                f'<div><span style="color:{t["text_secondary"]};">Capital</span><br/><strong>{html.escape(_ci.get("capital", ""))}</strong></div>'
+                f'</div></div>'
+            )
+
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:24px;margin-top:16px;">'
+            # Header
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">'
+            f'<div style="display:flex;align-items:center;gap:10px;">'
+            f'<div style="width:32px;height:32px;border-radius:8px;background:{t["accent"]};display:flex;align-items:center;justify-content:center;">'
+            f'<span style="color:#fff;font-size:0.8rem;font-weight:700;">AI</span></div>'
+            f'<div><div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Vérification web</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};">{html.escape(vr.get("company", ""))} · champ « {html.escape(vr.get("field_label", ""))} »</div></div>'
+            f'</div></div>'
+            # Field info
+            f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:14px 18px;margin-bottom:16px;">'
+            f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:0.78rem;">'
+            f'<div><span style="color:{t["text_secondary"]};">Entreprise</span><br/><strong style="color:{t["text_primary"]};">{html.escape(vr.get("company", ""))}</strong></div>'
+            f'<div><span style="color:{t["text_secondary"]};">Champ</span><br/><strong style="color:{t["text_primary"]};">{html.escape(vr.get("field_label", ""))}</strong></div>'
+            f'<div><span style="color:{t["text_secondary"]};">Valeur dans le fichier</span><br/><strong style="color:{t["text_primary"]};">{html.escape(str(vr.get("field_value", "") or "— (vide)"))}</strong></div>'
+            f'<div><span style="color:{t["text_secondary"]};">Attendu (référence)</span><br/><strong style="color:{_v_color};">{html.escape(str(vr.get("expected_value", "")))}</strong></div>'
+            f'</div></div>'
+            # Sources
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
+            f'<span style="color:#0d9488;font-size:0.85rem;">✓</span>'
+            f'<span style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">Scan web</span>'
+            f'<span style="font-size:0.65rem;padding:2px 8px;background:{t["accent_soft"]};color:{t["accent"]};border-radius:999px;font-weight:600;">{len(vr.get("sources", []))} sources</span></div>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:6px;">{_src_html}</div></div>'
+            # Company info
+            f'{_ci_html}'
+            # Summary
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
+            f'<span style="color:#0d9488;font-size:0.85rem;">✓</span>'
+            f'<span style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">Résumé</span></div>'
+            f'<div style="background:{t["border_subtle"]};border-radius:8px;padding:12px 16px;font-size:0.8rem;color:{t["text_primary"]};line-height:1.5;">'
+            f'{html.escape(vr.get("web_summary", ""))}</div></div>'
+            # Verdict
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
+            f'<span style="color:{_v_color};font-size:0.85rem;">{_v_icon}</span>'
+            f'<span style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};">Jugement du LLM</span></div>'
+            f'<div style="background:{_v_bg};border-radius:10px;padding:16px 18px;border-left:3px solid {_v_color};">'
+            f'<div style="font-size:0.88rem;font-weight:700;color:{_v_color};margin-bottom:6px;">{_v_label}</div>'
+            f'<div style="font-size:0.78rem;color:{t["text_primary"]};line-height:1.5;margin-bottom:10px;">{html.escape(_vr_expl)}</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="font-size:0.7rem;color:{t["text_secondary"]};">Confiance</span>'
+            f'<div style="flex:1;height:6px;background:{t["border"]};border-radius:3px;overflow:hidden;">'
+            f'<div style="width:{_vr_conf}%;height:100%;background:{_conf_color};border-radius:3px;"></div></div>'
+            f'<span style="font-size:0.75rem;font-weight:700;color:{t["text_primary"]};">{_vr_conf} %</span>'
+            f'</div></div></div>'
+            # Suggested action
+            + (f'<div style="background:{t["border_subtle"]};border-radius:8px;padding:12px 16px;">'
+               f'<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};font-weight:600;margin-bottom:4px;">Action suggérée par l\'IA</div>'
+               f'<div style="font-size:0.82rem;font-weight:600;color:{t["accent"]};">{html.escape(_vr_action)}</div>'
+               + (f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:4px;">Valeur suggérée : <strong>{html.escape(str(_vr_suggested))}</strong></div>' if _vr_suggested else "")
+               + f'</div>' if _vr_action else "")
+            + f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Action buttons for verdict
+        _v_col1, _v_col2, _v_col3 = st.columns(3)
+        with _v_col1:
+            if _vr_suggested and st.button("✓ Accepter la correction", type="primary", key="web_verify_accept"):
+                _fid = st.session_state.get("web_verify_finding_id")
+                if _fid:
+                    update_finding_status(_fid, "Resolved")
+                    add_audit_entry("Vérification web", f"Accepté: {vr.get('company', '')} — {vr.get('field_label', '')}")
+                st.session_state.pop("web_verify_result", None)
+                st.rerun()
+        with _v_col2:
+            if st.button("✕ Rejeter", key="web_verify_reject"):
+                _fid = st.session_state.get("web_verify_finding_id")
+                if _fid:
+                    update_finding_status(_fid, "Dismissed")
+                    add_audit_entry("Vérification web", f"Rejeté: {vr.get('company', '')} — {vr.get('field_label', '')}")
+                st.session_state.pop("web_verify_result", None)
+                st.rerun()
+        with _v_col3:
+            if st.button("Fermer", key="web_verify_close"):
+                st.session_state.pop("web_verify_result", None)
+                st.rerun()
+
+    # Pagination info
+    if len(findings) > 500:
+        st.caption(f"{len(findings)} anomalies affichées. Utilisez les filtres pour affiner.")
+
+
+def page_tasks():
+    t = get_theme()
+    accent = t['accent']
+
+    # --- Premium header ---
+    st.markdown(f'''
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:28px;">
+        <div>
+            <h1 style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px;">T\u00e2ches</h1>
+            <p style="font-size:0.85rem;color:{t["text_secondary"]};margin:0;">Pr\u00e9s\u00e9lection et validation des anomalies \u2014 acceptez, corrigez ou rejetez en masse.</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;">
+            <span style="font-size:0.72rem;padding:5px 14px;background:{t["accent_soft"]};color:{accent};
+                border-radius:999px;font-weight:600;">Moteur pr\u00eat</span>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    actionable = [f for f in get_all_fr_anomalies() if f.get("status") in ("Open", "In Review")]
+    if not actionable:
+        st.success("Toutes les tâches ont été traitées.")
+        return
+
+    # Auto-assign priority
+    if "task_priorities" not in st.session_state:
+        st.session_state["task_priorities"] = {
+            f["id"]: ("urgent" if f["severity"] == "HIGH" else ("normal" if f["severity"] == "MEDIUM" else "bas"))
+            for f in actionable
+        }
+
+    # --- Stats bar with SVG icons ---
+    urgent = sum(1 for f in actionable if st.session_state["task_priorities"].get(f["id"]) == "urgent")
+    normal = sum(1 for f in actionable if st.session_state["task_priorities"].get(f["id"]) == "normal")
+    bas = len(actionable) - urgent - normal
+
+    svg_urgent = '<svg width="22" height="22" fill="none" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M12 3l9.66 16.59A1 1 0 0120.66 21H3.34a1 1 0 01-.86-1.41L12 3z" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    svg_normal = '<svg width="22" height="22" fill="none" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke="{}" stroke-width="2"/><path d="M12 8v4l3 3" stroke="{}" stroke-width="2" stroke-linecap="round"/></svg>'.format(accent, accent)
+    svg_low = '<svg width="22" height="22" fill="none" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    svg_total = '<svg width="22" height="22" fill="none" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1" stroke="{}" stroke-width="2"/><rect x="14" y="3" width="7" height="7" rx="1" stroke="{}" stroke-width="2"/><rect x="3" y="14" width="7" height="7" rx="1" stroke="{}" stroke-width="2"/><rect x="14" y="14" width="7" height="7" rx="1" stroke="{}" stroke-width="2"/></svg>'.format(t['text_primary'], t['text_primary'], t['text_primary'], t['text_primary'])
+
+    st.markdown(
+        f"""<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px;">
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#ef4444;"></div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="font-size:0.68rem;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Urgent</div>
+                    <div style="width:30px;height:30px;border-radius:8px;background:rgba(239,68,68,0.1);display:flex;align-items:center;justify-content:center;">{svg_urgent}</div>
+                </div>
+                <div style="font-size:2rem;font-weight:800;color:#ef4444;margin-top:8px;line-height:1;">{urgent}</div>
+                <div style="font-size:0.7rem;color:{t['text_secondary']};margin-top:4px;">Anomalies critiques</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:{accent};"></div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="font-size:0.68rem;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Normal</div>
+                    <div style="width:30px;height:30px;border-radius:8px;background:{t['accent_soft']};display:flex;align-items:center;justify-content:center;">{svg_normal}</div>
+                </div>
+                <div style="font-size:2rem;font-weight:800;color:{accent};margin-top:8px;line-height:1;">{normal}</div>
+                <div style="font-size:0.7rem;color:{t['text_secondary']};margin-top:4px;">À traiter</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#94a3b8;"></div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="font-size:0.68rem;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Bas</div>
+                    <div style="width:30px;height:30px;border-radius:8px;background:{t['border_subtle']};display:flex;align-items:center;justify-content:center;">{svg_low}</div>
+                </div>
+                <div style="font-size:2rem;font-weight:800;color:{t['text_secondary']};margin-top:8px;line-height:1;">{bas}</div>
+                <div style="font-size:0.7rem;color:{t['text_secondary']};margin-top:4px;">Priorité basse</div>
+            </div>
+            <div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;padding:18px 20px;position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:{t['text_primary']};"></div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="font-size:0.68rem;color:{t['text_secondary']};text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Total</div>
+                    <div style="width:30px;height:30px;border-radius:8px;background:{t['border_subtle']};display:flex;align-items:center;justify-content:center;">{svg_total}</div>
+                </div>
+                <div style="font-size:2rem;font-weight:800;color:{t['text_primary']};margin-top:8px;line-height:1;">{len(actionable)}</div>
+                <div style="font-size:0.7rem;color:{t['text_secondary']};margin-top:4px;">Tâches en file</div>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # --- Filters ---
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        filter_priority = st.selectbox("Priorité", ["Toutes", "urgent", "normal", "bas"], key="tasks_filter_prio")
+    with col_f2:
+        filter_severity = st.selectbox("Sévérité", ["Toutes", "HIGH", "MEDIUM", "LOW"], key="tasks_filter_sev")
+    with col_f3:
+        filter_rule = st.selectbox("Règle", ["Toutes"] + sorted({f.get("rule_id", "") for f in actionable}), key="tasks_filter_rule")
+
+    # Apply filters
+    filtered = actionable
+    if filter_priority != "Toutes":
+        filtered = [f for f in filtered if st.session_state["task_priorities"].get(f["id"]) == filter_priority]
+    if filter_severity != "Toutes":
+        filtered = [f for f in filtered if f.get("severity") == filter_severity]
+    if filter_rule != "Toutes":
+        filtered = [f for f in filtered if f.get("rule_id") == filter_rule]
+
+    # Sort by priority
+    priority_order = {"urgent": 0, "normal": 1, "bas": 2}
+    filtered = sorted(filtered, key=lambda f: priority_order.get(st.session_state["task_priorities"].get(f["id"], "normal"), 1))
+
+    # --- Select all toggle ---
+    select_all_tasks = st.checkbox("Tout sélectionner", value=True, key="tasks_select_all")
+
+    # --- Build DataFrame for editable table ---
+    table_data = []
+    for f in filtered:
+        prio = st.session_state["task_priorities"].get(f["id"], "normal")
+        table_data.append({
+            "Sélectionner": select_all_tasks,
+            "Priorité": prio.capitalize(),
+            "Entreprise": f.get("company_name", ""),
+            "Anomalie": f.get("finding_type", ""),
+            "Champ": f.get("field_label", ""),
+            "Valeur": str(f.get("field_value", "") or "—"),
+            "Attendu": str(f.get("expected_value", "")),
+            "Sévérité": f.get("severity", ""),
+            "Règle": f.get("rule_id", ""),
+            "_id": f["id"],
+        })
+
+    if not table_data:
+        st.info("Aucune anomalie ne correspond aux filtres.")
+        return
+
+    df_table = pd.DataFrame(table_data)
+
+    # Interactive data editor with checkbox column
+    edited_df = st.data_editor(
+        df_table.drop(columns=["_id"]),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Sélectionner": st.column_config.CheckboxColumn("✓", default=True, width="small"),
+            "Priorité": st.column_config.SelectboxColumn("Priorité", options=["Urgent", "Normal", "Bas"], width="small"),
+            "Sévérité": st.column_config.SelectboxColumn("Sévérité", options=["HIGH", "MEDIUM", "LOW"], width="small"),
+            "Entreprise": st.column_config.TextColumn("Entreprise", width="medium"),
+            "Anomalie": st.column_config.TextColumn("Anomalie", width="medium"),
+            "Champ": st.column_config.TextColumn("Champ", width="small"),
+            "Valeur": st.column_config.TextColumn("Valeur", width="medium"),
+            "Attendu": st.column_config.TextColumn("Attendu", width="medium"),
+            "Règle": st.column_config.TextColumn("Règle", width="small"),
+        },
+        key="tasks_editor",
+        num_rows="fixed",
+    )
+
+    # Get selected IDs — if "Tout sélectionner" is on, use ALL filtered findings
+    if select_all_tasks:
+        selected_ids = [f["id"] for f in filtered]
+    else:
+        selected_mask = edited_df["Sélectionner"].tolist()
+        selected_ids = [df_table.iloc[i]["_id"] for i, sel in enumerate(selected_mask) if sel]
+
+    # --- Action bar ---
+    st.markdown(
+        f'<div style="font-size:0.82rem;font-weight:600;color:{t["text_primary"]};margin:12px 0 8px;">'
+        f'{len(selected_ids)} anomalie(s) sélectionnée(s) sur {len(filtered)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    act1, act2, act3, act4 = st.columns(4)
+
+    with act1:
+        if st.button("Corriger (INSEE)", type="primary", key="tasks_bulk_fix", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Correction via INSEE ({len(selected_ids)} anomalies)..."):
+                corrections = []
+                for fid in selected_ids:
+                    f = next((x for x in actionable if x["id"] == fid), None)
+                    if not f:
+                        continue
+                    corr = _auto_correct_finding(f)
+                    if corr:
+                        corrections.append({"id": fid, "company": f["company_name"], "field": f.get("field_label", ""), "old": f.get("field_value", ""), "new": corr})
+                st.session_state["tasks_corrections_preview"] = corrections
+                st.session_state["tasks_corrections_all_ids"] = selected_ids
+            st.rerun()
+
+    with act2:
+        if st.button("Accepter", key="tasks_bulk_accept", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Mise à jour de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "In Review")
+            add_audit_entry("Tâches acceptées", f"{len(selected_ids)} anomalies → En revue")
+            st.rerun()
+
+    with act3:
+        if st.button("Résoudre", key="tasks_bulk_resolve", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Résolution de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "Resolved")
+            add_audit_entry("Tâches résolues", f"{len(selected_ids)} anomalies → Résolu")
+            st.rerun()
+
+    with act4:
+        if st.button("Rejeter", key="tasks_bulk_reject", use_container_width=True, disabled=not selected_ids):
+            with st.spinner(f"Rejet de {len(selected_ids)} anomalies..."):
+                update_findings_status_batch(selected_ids, "Dismissed")
+            add_audit_entry("Tâches rejetées", f"{len(selected_ids)} anomalies → Rejeté")
+            st.rerun()
+
+    # --- Corrections preview (after AI fix) ---
+    if st.session_state.get("tasks_corrections_preview"):
+        st.markdown("---")
+        st.markdown(f'<div style="font-size:0.85rem;font-weight:700;color:{t["text_primary"]};margin-bottom:10px;">Corrections proposées par Cortex AI</div>', unsafe_allow_html=True)
+        corrs = st.session_state["tasks_corrections_preview"]
+        _all_selected = st.session_state.get("tasks_corrections_all_ids", [])
+        corr_table = pd.DataFrame([{"Entreprise": c["company"], "Champ": c["field"], "Ancien": c["old"], "Nouveau (INSEE)": c["new"]} for c in corrs])
+        st.dataframe(corr_table, use_container_width=True, hide_index=True)
+
+        col_v, col_r = st.columns(2)
+        with col_v:
+            if st.button(f"Appliquer et résoudre tout ({len(_all_selected)})", type="primary", key="tasks_apply_corr", use_container_width=True):
+                with st.spinner(f"Résolution de {len(_all_selected)} anomalies..."):
+                    update_findings_status_batch(_all_selected, "Resolved")
+                    add_audit_entry("Corrections AI appliquées", f"{len(corrs)} corrigées, {len(_all_selected)} résolues")
+                st.session_state.pop("tasks_corrections_preview", None)
+                st.session_state.pop("tasks_corrections_all_ids", None)
+                st.rerun()
+        with col_r:
+            if st.button("Annuler", key="tasks_cancel_corr", use_container_width=True):
+                st.session_state.pop("tasks_corrections_preview", None)
+                st.session_state.pop("tasks_corrections_all_ids", None)
+                st.rerun()
+
+    # --- Export ---
+    st.markdown("---")
+    col_exp1, col_exp2, _ = st.columns([1, 1, 2])
+    with col_exp1:
+        export_df = pd.DataFrame(actionable)
+        if not export_df.empty:
+            export_df["priorite"] = export_df["id"].map(st.session_state.get("task_priorities", {}))
+            st.download_button("Exporter CSV", export_df.to_csv(index=False), file_name="taches_anomalies.csv", mime="text/csv", key="tasks_export_csv")
+    with col_exp2:
+        jira_data = [{"summary": f"{f['finding_type']} — {f['company_name']}", "description": f"Champ: {f.get('field_label', '')} | Valeur: {f.get('field_value', '')} | Attendu: {f.get('expected_value', '')}", "priority": st.session_state.get("task_priorities", {}).get(f["id"], "normal").capitalize(), "labels": ["data-quality", f["severity"].lower()]} for f in actionable]
+        st.download_button("Exporter Jira/Notion", json.dumps(jira_data, ensure_ascii=False, indent=2), file_name="taches_jira.json", mime="application/json", key="tasks_export_jira")
+
+
+def page_exports():
+    t = get_theme()
+    accent = t['accent']
+
+    # --- Premium header ---
+    st.markdown(f'''
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:28px;">
+        <div>
+            <h1 style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px;">Exports &amp; Audit</h1>
+            <p style="font-size:0.85rem;color:{t["text_secondary"]};margin:0;">Rapports, restitution CRM et piste d\u2019audit compl\u00e8te.</p>
+        </div>
+    </div>
+    ''', unsafe_allow_html=True)
+
+    today_str = _now().strftime("%Y%m%d")
+    today_label = _now().strftime("%Y-%m-%d")
+    # Use uploaded file if available, otherwise Snowflake table
+    if st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state:
+        _accounts = st.session_state["uploaded_df"].to_dict("records")
+    elif "wizard_uploaded_df" in st.session_state and st.session_state["wizard_uploaded_df"] is not None and not st.session_state["wizard_uploaded_df"].empty:
+        _accounts = st.session_state["wizard_uploaded_df"].to_dict("records")
+    else:
+        _accounts = load_dim_account(st.session_state.get("import_wizard_table", _dim_account_fqn()))
+    _findings = get_all_fr_anomalies()
+    _corrections = get_fr_corrections()
+
+    # Also derive corrections from findings (expected_value = corrected value)
+    # This ensures the export has corrections even if user didn't manually apply them
+    _findings_as_corrections = []
+    for f in (_findings or []):
+        exp = f.get("expected_value", "")
+        # Skip generic/non-actionable expected values
+        if exp and exp not in ("9 chiffres numériques", "14 chiffres numériques", "9 chiffres",
+                               "14 chiffres", "XX.XXZ", "Non vide", "SA, SAS, SARL, SE…",
+                               "XX.XXZ (ex : 6202A)", "Format FRxxxxxxxxxxx", "Active (A)",
+                               "Présent au registre SIRENE", "Présent au registre INSEE SIRENE"):
+            _findings_as_corrections.append({
+                "company_name": f.get("company_name", ""),
+                "account_id": f.get("account_id", ""),
+                "field": f.get("field", ""),
+                "field_label": f.get("field_label", ""),
+                "new_value": exp,
+            })
+    # Merge: DB corrections take priority, then findings-derived
+    _all_corrections = list(_corrections or []) + _findings_as_corrections
+
+    # --- Section 1: Export rapport ---
+    st.markdown(
+        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;margin-bottom:20px;">'
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div style="width:34px;height:34px;border-radius:10px;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;">'
+        f'<svg width="18" height="18" fill="none" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="{accent}" stroke-width="2"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" stroke="{accent}" stroke-width="2" stroke-linecap="round"/></svg>'
+        f'</div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Exports de données</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Téléchargez les données analysées en CSV pour votre CRM ou vos rapports.</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Build enriched export: original + corrected columns side by side (interleaved)
+    _base_df = pd.DataFrame(_accounts) if _accounts else pd.DataFrame()
+    _corr_list = _all_corrections or []
+
+    # Clean newlines in all cells
+    if not _base_df.empty:
+        for col in _base_df.columns:
+            _base_df[col] = _base_df[col].apply(lambda x: str(x).replace("\n", " ").replace("\r", " ") if pd.notna(x) else "")
+
+    if not _base_df.empty and _corr_list:
+        # Group corrections by company_name
+        corr_map = {}
+        for c in _corr_list:
+            key = str(c.get("company_name", "") or c.get("account_id", "")).strip()
+            if not key:
+                continue
+            if key not in corr_map:
+                corr_map[key] = {}
+            field = c.get("field", c.get("field_label", ""))
+            new_val = c.get("new_value", c.get("corrected_value", c.get("expected_value", "")))
+            if field and new_val:
+                corr_map[key][field] = new_val
+
+        # Find which fields have corrections
+        _all_corr_fields = set()
+        for corrections in corr_map.values():
+            _all_corr_fields.update(corrections.keys())
+
+        # Map correction field names to actual column names in the dataframe
+        _col_lower_map = {c.lower(): c for c in _base_df.columns}
+        # Common field name aliases for matching
+        _field_aliases = {
+            "SIREN": ["siren", "num_siren", "no_siren"],
+            "SIRET": ["siret", "num_siret", "no_siret"],
+            "VAT_NUMBER": ["vat", "tva", "vat_number", "tva_intra", "n_tva"],
+            "CITY": ["city", "ville", "commune"],
+            "ADDRESS": ["address", "adresse", "adresse_siege"],
+            "NAF": ["naf", "ape", "code_naf", "code_ape"],
+            "COMPANY_NAME": ["company_name", "raison_sociale", "nom", "name", "denomination"],
+            "LEGAL_FORM": ["legal_form", "forme_juridique", "forme"],
+        }
+        _field_to_col = {}
+        for f in _all_corr_fields:
+            if f in _base_df.columns:
+                _field_to_col[f] = f
+            elif f.lower() in _col_lower_map:
+                _field_to_col[f] = _col_lower_map[f.lower()]
+            else:
+                # Try aliases
+                aliases = _field_aliases.get(f, _field_aliases.get(f.upper(), []))
+                for alias in aliases:
+                    if alias.lower() in _col_lower_map:
+                        _field_to_col[f] = _col_lower_map[alias.lower()]
+                        break
+
+        # Build interleaved columns: for each original column, if it has corrections, add [CORRIGÉ] right after
+        _name_cols = [c for c in _base_df.columns if c.lower() in ("company_name", "nom", "raison_sociale", "name")]
+        _id_cols = [c for c in _base_df.columns if c.lower() in ("account_id", "id", "code_client")]
+
+        # Compute corrections per row
+        _corr_values = {}  # {row_idx: {field: new_val}}
+        for idx, row in _base_df.iterrows():
+            _matched_key = None
+            for nc in _name_cols:
+                _val = str(row.get(nc, "")).strip()
+                if _val and _val in corr_map:
+                    _matched_key = _val
+                    break
+            if not _matched_key:
+                for ic in _id_cols:
+                    _val = str(row.get(ic, "")).strip()
+                    if _val and _val in corr_map:
+                        _matched_key = _val
+                        break
+            if _matched_key:
+                _corr_values[idx] = corr_map[_matched_key]
+
+        # Build new dataframe with interleaved columns
+        _new_cols = []
+        _already_paired = set()
+        for col in _base_df.columns:
+            _new_cols.append(col)
+            # Check if this column has a matching correction field
+            for f, mapped_col in _field_to_col.items():
+                if mapped_col == col and f not in _already_paired:
+                    _new_cols.append(f"{col} [CORRIG\u00c9]")
+                    _already_paired.add(f)
+                    break
+
+        # Add correction fields that don't match any existing column
+        for f in sorted(_all_corr_fields):
+            if f not in _already_paired:
+                _new_cols.append(f"{f} [CORRIG\u00c9]")
+
+        # Build the export dataframe
+        _enriched = pd.DataFrame(index=_base_df.index, columns=_new_cols)
+        for col in _base_df.columns:
+            _enriched[col] = _base_df[col]
+
+        # Fill correction columns
+        for idx, corrections in _corr_values.items():
+            for field, val in corrections.items():
+                # Find the matching [CORRIGÉ] column
+                mapped_col = _field_to_col.get(field)
+                if mapped_col:
+                    corr_col = f"{mapped_col} [CORRIG\u00c9]"
+                else:
+                    corr_col = f"{field} [CORRIG\u00c9]"
+                if corr_col in _enriched.columns:
+                    _enriched.at[idx, corr_col] = val
+
+        # Fill empty correction columns with empty string
+        _enriched = _enriched.fillna("")
+        _export_df = _enriched
+    else:
+        _export_df = _base_df
+
+    exports = [
+        {"name": f"rapport_anomalies_{today_str}.csv", "date": today_label, "type": "Anomalies",
+         "df": pd.DataFrame(_findings) if _findings else pd.DataFrame()},
+    ]
+
+    # --- Card grid: Anomalies CSV + XLSX report ---
+    _card_col1, _card_col2 = st.columns(2)
+
+    # Card 1: Anomalies CSV
+    _anom_df = exports[0]["df"]
+    _anom_rows = len(_anom_df)
+    with _card_col1:
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:18px 20px;text-align:center;">'
+            f'<div style="width:36px;height:36px;border-radius:10px;background:rgba(239,68,68,0.08);display:inline-flex;align-items:center;justify-content:center;margin-bottom:10px;">'
+            f'<svg width="20" height="20" fill="none" viewBox="0 0 24 24"><path d="M12 9v4m0 4h.01M12 3l9.66 16.59A1 1 0 0120.66 21H3.34a1 1 0 01-.86-1.41L12 3z" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/></svg></div>'
+            f'<div style="font-size:0.72rem;font-weight:700;color:#ef4444;text-transform:uppercase;letter-spacing:0.05em;">ANOMALIES</div>'
+            f'<div style="font-size:1.8rem;font-weight:800;color:{t["text_primary"]};margin:6px 0;">{_anom_rows}</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};">lignes · {today_label}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if not _anom_df.empty:
+            st.download_button(
+                "Télécharger CSV",
+                _anom_df.to_csv(index=False),
+                file_name=exports[0]["name"],
+                mime="text/csv",
+                key="dl_anomalies_csv",
+                use_container_width=True,
+            )
+
+    # Card 2: XLSX colored report
+    with _card_col2:
+        st.markdown(
+            f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:18px 20px;text-align:center;">'
+            f'<div style="width:36px;height:36px;border-radius:10px;background:rgba(5,150,105,0.08);display:inline-flex;align-items:center;justify-content:center;margin-bottom:10px;">'
+            f'<svg width="20" height="20" fill="none" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z" stroke="#059669" stroke-width="2"/><path d="M14 2v6h6" stroke="#059669" stroke-width="2"/></svg></div>'
+            f'<div style="font-size:0.72rem;font-weight:700;color:#059669;text-transform:uppercase;letter-spacing:0.05em;">RAPPORT XLSX COLORÉ</div>'
+            f'<div style="font-size:1.8rem;font-weight:800;color:{t["text_primary"]};margin:6px 0;">{len(_base_df)}</div>'
+            f'<div style="font-size:0.7rem;color:{t["text_secondary"]};">lignes · original + corrections + SIRENE</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if not _base_df.empty:
+            if st.session_state.get("_xlsx_report_bytes"):
+                st.download_button(
+                    "Télécharger XLSX",
+                    st.session_state["_xlsx_report_bytes"],
+                    file_name=st.session_state.get("_xlsx_report_name", f"rapport_qualite_{today_str}.xlsx"),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_xlsx_card",
+                    use_container_width=True,
+                )
+            else:
+                if st.button("Générer le rapport XLSX", type="primary", key="gen_xlsx_card", use_container_width=True):
+                    with st.spinner("Génération du rapport XLSX coloré..."):
+                        _xlsx_mapping = _mapping_for_table(
+                            st.session_state.get("import_wizard_table", _dim_account_fqn()),
+                            list(_base_df.columns) if not _base_df.empty else None,
+                        )
+                        _xlsx_bytes = generate_xlsx_report(
+                            _base_df, _findings or [], _xlsx_mapping,
+                        )
+                        st.session_state["_xlsx_report_bytes"] = _xlsx_bytes
+                        st.session_state["_xlsx_report_name"] = f"rapport_qualite_{today_str}.xlsx"
+                    st.rerun()
+
+    # --- Section 2: Piste d'audit ---
+    st.markdown(
+        f'<div style="background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;padding:22px 24px;margin-top:24px;">'
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div style="width:34px;height:34px;border-radius:10px;background:{t["accent_soft"]};display:flex;align-items:center;justify-content:center;">'
+        f'<svg width="18" height="18" fill="none" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="{accent}" stroke-width="2"/><path d="M12 6v6l4 2" stroke="{accent}" stroke-width="2" stroke-linecap="round"/></svg>'
+        f'</div>'
+        f'<div>'
+        f'<div style="display:flex;align-items:center;gap:8px;">'
+        f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Piste d\'Audit Temporelle</span>'
+        f'<span style="font-size:0.62rem;padding:2px 8px;background:{t["accent_soft"]};color:{accent};border-radius:4px;font-weight:600;">DQ_AUDIT_LOG</span>'
+        f'</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Chaque action utilisateur est tracée et persistée dans Snowflake.</div>'
+        f'</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    audit_entries = load_dq_audit_log()
+    if audit_entries:
+        audit_df = pd.DataFrame(audit_entries)
+        # Build styled audit table
+        display_cols = []
+        if "time" in audit_df.columns:
+            display_cols.append("time")
+        if "action" in audit_df.columns:
+            display_cols.append("action")
+        if "detail" in audit_df.columns:
+            display_cols.append("detail")
+        if "user" in audit_df.columns:
+            display_cols.append("user")
+
+        if display_cols:
+            show_df = audit_df[display_cols].head(20)
+            show_df.columns = [{"time": "Timestamp", "action": "Action", "detail": "Détail", "user": "Utilisateur"}.get(c, c) for c in display_cols]
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(audit_df.head(20), use_container_width=True, hide_index=True)
+
+        st.caption(f"Toutes les décisions sont persistées dans `DQ_AUDIT_LOG` · Snowflake `QUALITY_TEST.DATA_QUALITY`")
+    else:
+        st.info("Aucune entrée d'audit pour le moment. Les actions seront tracées automatiquement.")
+
+
+def generate_xlsx_report(
+    base_df: pd.DataFrame,
+    anomalies: list[dict],
+    mapping: dict[str, str | None],
+    sirene_cache: dict | None = None,
+) -> bytes:
+    """Generate a colored XLSX report with Original | Meta | Corrected | SIRENE columns."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    if base_df.empty:
+        wb = Workbook()
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    # --- Build anomaly index: row_num -> list of anomalies ---
+    _anom_by_row: dict[int, list[dict]] = {}
+    for a in anomalies:
+        rn = a.get("row_num", 0)
+        _anom_by_row.setdefault(rn, []).append(a)
+
+    # --- Build SIRENE cache if not provided ---
+    if sirene_cache is None:
+        sirene_cache = {}
+        try:
+            sirene_cache = load_sirene_cache()
+        except Exception:
+            pass
+
+    # --- Column layout ---
+    orig_cols = list(base_df.columns)
+    meta_cols = ["LIGNE_ANOMALIE", "COMMENTAIRE"]
+    corr_cols = [f"{c}_CORRIGE" for c in orig_cols]
+    sirene_cols = ["SIRENE_RAISON_SOCIALE", "SIRENE_ADRESSE", "SIRENE_NAF", "SIRENE_FORME_JURIDIQUE", "SIRENE_ETAT"]
+    all_cols = orig_cols + meta_cols + corr_cols + sirene_cols
+
+    # --- Styles ---
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    hdr_orig = PatternFill("solid", fgColor="4A4A4A")
+    hdr_meta = PatternFill("solid", fgColor="D97706")
+    hdr_corr = PatternFill("solid", fgColor="059669")
+    hdr_sirene = PatternFill("solid", fgColor="2563EB")
+    fill_anomaly = PatternFill("solid", fgColor="FFE0E0")
+    fill_corrected = PatternFill("solid", fgColor="E0FFE0")
+    fill_sirene = PatternFill("solid", fgColor="E0F0FF")
+    font_red = Font(color="DC2626", bold=True)
+    font_green = Font(color="059669", bold=True)
+    thin_border = Border(
+        left=Side(style="thin", color="D0D0D0"),
+        right=Side(style="thin", color="D0D0D0"),
+        top=Side(style="thin", color="D0D0D0"),
+        bottom=Side(style="thin", color="D0D0D0"),
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Rapport Qualite"
+
+    # --- Header row ---
+    for col_idx, col_name in enumerate(all_cols, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin_border
+        if col_name in orig_cols:
+            cell.fill = hdr_orig
+        elif col_name in meta_cols:
+            cell.fill = hdr_meta
+        elif col_name in corr_cols:
+            cell.fill = hdr_corr
+        else:
+            cell.fill = hdr_sirene
+
+    # --- Reverse mapping: field name -> column in df ---
+    _field_to_col = {}
+    _col_to_field = {}
+    for field, col in (mapping or {}).items():
+        if col and col in base_df.columns:
+            _field_to_col[field] = col
+            _col_to_field[col] = field
+    # Also map uppercase field names (from anomaly "field" key)
+    _field_upper_map = {
+        "SIREN": "siren", "SIRET": "siret", "VAT_NUMBER": "vat",
+        "NAF": "naf", "COMPANY_NAME": "company_name", "ADDRESS": "address",
+        "CITY": "city", "LEGAL_FORM": "legal_form",
+    }
+
+    # --- Data rows ---
+    for df_idx, (_, row) in enumerate(base_df.iterrows()):
+        row_num = df_idx + 2  # row_num in anomaly = df_idx + 2 (header=1)
+        xl_row = df_idx + 2  # Excel row (header=1)
+        row_anomalies = _anom_by_row.get(row_num, [])
+
+        # Get SIREN for SIRENE lookup
+        siren_col = mapping.get("siren") if mapping else None
+        siren_val = ""
+        if siren_col and siren_col in row.index:
+            siren_val = re.sub(r'\D', '', str(row[siren_col] or "")).strip()
+            if len(siren_val) != 9:
+                siren_val = ""
+        # Try extracting from SIRET
+        if not siren_val:
+            siret_col = mapping.get("siret") if mapping else None
+            if siret_col and siret_col in row.index:
+                siret_val = re.sub(r'\D', '', str(row[siret_col] or "")).strip()
+                if len(siret_val) >= 9:
+                    siren_val = siret_val[:9]
+        ref = sirene_cache.get(siren_val, {}) if siren_val else {}
+
+        # Build anomaly corrections map: field -> expected_value
+        _corrections_map: dict[str, str] = {}
+        _anomaly_rules: list[str] = []
+        _comments: list[str] = []
+        for a in row_anomalies:
+            rule = a.get("rule_id", "")
+            field = a.get("field", "")
+            expected = a.get("expected_value", "")
+            finding_type = a.get("finding_type", "")
+            _anomaly_rules.append(f"{rule}: {finding_type}")
+
+            # Resolve actual field to a column name
+            _resolved_field = _field_upper_map.get(field, field)
+            _col_name = _field_to_col.get(_resolved_field, field)
+            if _col_name not in base_df.columns:
+                _col_name = _field_to_col.get(field.lower(), "")
+
+            # Check if expected is a concrete correction
+            _generic = {
+                "9 chiffres", "9 chiffres numériques", "14 chiffres", "14 chiffres numériques",
+                "FR + 11 caractères", "TVA FR obligatoire", "Non vide", "XX.XXZ",
+                "XX.XXZ (ex : 6202A)", "SA, SAS, SARL, SE…", "Active (A)",
+                "Présent au registre SIRENE", "Présent au registre INSEE SIRENE",
+            }
+            _is_generic = (
+                not expected or expected in _generic
+                or expected.startswith("Valeur parmi") or expected.startswith("Format ")
+                or expected.startswith("Unique (") or expected.startswith("Longueur ")
+                or re.search(r'[\^\$\[\]\{\}\+\*\?\\]', expected)
+            )
+            if not _is_generic and _col_name:
+                _corrections_map[_col_name] = expected
+                _comments.append(f"{field} corrige via INSEE (confiance 95%): {expected}")
+            elif not _is_generic:
+                _comments.append(f"{field}: {expected}")
+
+        # --- Write original columns ---
+        col_offset = 0
+        for c_idx, col_name in enumerate(orig_cols):
+            _raw = str(row.get(col_name, "") or "")
+            if _raw in ("nan", "None", "NaT"):
+                _raw = ""
+            cell = ws.cell(row=xl_row, column=c_idx + 1, value=_raw)
+            cell.border = thin_border
+            # Highlight if this column has an anomaly
+            if col_name in _corrections_map:
+                cell.fill = fill_anomaly
+
+        col_offset = len(orig_cols)
+
+        # --- LIGNE_ANOMALIE ---
+        if row_anomalies:
+            ligne_val = "Oui -- " + ", ".join(_anomaly_rules)
+            cell = ws.cell(row=xl_row, column=col_offset + 1, value=ligne_val)
+            cell.font = font_red
+        else:
+            cell = ws.cell(row=xl_row, column=col_offset + 1, value="Non")
+            cell.font = font_green
+        cell.border = thin_border
+
+        # --- COMMENTAIRE ---
+        comment_val = ". ".join(_comments) if _comments else ""
+        # Auto-add TVA computation note
+        if siren_val and not _corrections_map.get(_field_to_col.get("vat", ""), ""):
+            _computed_vat = _vat_from_siren(siren_val)
+            if _computed_vat:
+                comment_val += f" TVA calculee: {_computed_vat}" if comment_val else f"TVA calculee: {_computed_vat}"
+        ws.cell(row=xl_row, column=col_offset + 2, value=comment_val).border = thin_border
+
+        col_offset += len(meta_cols)
+
+        # --- {COL}_CORRIGE columns ---
+        for c_idx, col_name in enumerate(orig_cols):
+            corr_val = _corrections_map.get(col_name, "")
+            original_val = str(row.get(col_name, "") or "")
+            if original_val in ("nan", "None", "NaT"):
+                original_val = ""
+            # Special: TVA_CORRIGE -> compute from SIREN if TVA empty or missing
+            _field_key = _col_to_field.get(col_name, "")
+            if _field_key == "vat" and not corr_val:
+                _existing_vat = original_val.strip().upper().replace(" ", "")
+                if not _existing_vat and siren_val:
+                    _computed = _vat_from_siren(siren_val)
+                    if _computed:
+                        corr_val = _computed
+            # Always fill: correction if available, otherwise copy original value
+            final_val = corr_val if corr_val else original_val
+            cell = ws.cell(row=xl_row, column=col_offset + c_idx + 1, value=final_val)
+            cell.border = thin_border
+            if corr_val and corr_val != original_val:
+                cell.fill = fill_corrected
+
+        col_offset += len(corr_cols)
+
+        # --- SIRENE enrichment columns ---
+        sirene_values = [
+            str(ref.get("raison_sociale", "") or ""),
+            str(ref.get("adresse", "") or ""),
+            str(ref.get("naf", "") or ""),
+            str(ref.get("categorie_juridique", "") or ""),
+            str(ref.get("statut", "") or ""),
+        ]
+        for s_idx, s_val in enumerate(sirene_values):
+            cell = ws.cell(row=xl_row, column=col_offset + s_idx + 1, value=s_val)
+            cell.border = thin_border
+            if s_val:
+                cell.fill = fill_sirene
+
+    # --- Auto-fit column widths ---
+    for col_idx in range(1, len(all_cols) + 1):
+        max_len = len(str(ws.cell(row=1, column=col_idx).value or ""))
+        for row_idx in range(2, min(ws.max_row + 1, 102)):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val:
+                max_len = max(max_len, min(len(str(val)), 50))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 4
+
+    # --- Freeze panes + auto-filter ---
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(all_cols))}{ws.max_row}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# Available enrichment columns from Marketplace SIRENE
+SIRENE_ENRICHMENT_COLS = {
+    "denomination": "Raison sociale officielle",
+    "activite_principale": "Code NAF/APE",
+    "libelle_sous_classe": "Libellé activité",
+    "categorie_juridique": "Catégorie juridique (code)",
+    "etat_administratif": "Statut (Active/Radiée)",
+    "categorie_entreprise": "Taille (PME/ETI/GE)",
+    "tranche_effectifs": "Tranche effectifs",
+    "adresse_complete": "Adresse siège (composée)",
+    "code_postal": "Code postal",
+    "libelle_commune": "Commune",
+    "libelle_departement": "Département",
+    "libelle_region": "Région",
+}
+
+
+def enrich_with_sirene(df: pd.DataFrame, join_key: str, columns: list[str]) -> pd.DataFrame:
+    """Enrich a DataFrame by joining to the Marketplace SIRENE on SIREN or SIRET."""
+    if df.empty or not columns:
+        return df
+    siren_values = df[join_key].dropna().unique().tolist()
+    if not siren_values:
+        return df
+    values_sql = ",".join(f"'{str(v).strip()}'" for v in siren_values[:5000])
+
+    # Build SELECT columns
+    col_map = {
+        "denomination": "u.DENOMINATION",
+        "activite_principale": "u.ACTIVITE_PRINCIPALE",
+        "libelle_sous_classe": "u.LIBELLE_SOUS_CLASSE",
+        "categorie_juridique": "u.CATEGORIE_JURIDIQUE",
+        "etat_administratif": "u.ETAT_ADMINISTRATIF",
+        "categorie_entreprise": "u.CATEGORIE_ENTREPRISE",
+        "tranche_effectifs": "u.TRANCHE_EFFECTIFS",
+        "adresse_complete": "CONCAT_WS(' ', e.NUMERO_VOIE, e.TYPE_VOIE, e.LIBELLE_VOIE, e.CODE_POSTAL, e.LIBELLE_COMMUNE)",
+        "code_postal": "e.CODE_POSTAL",
+        "libelle_commune": "e.LIBELLE_COMMUNE",
+        "libelle_departement": "e.LIBELLE_DEPARTEMENT",
+        "libelle_region": "e.LIBELLE_REGION",
+    }
+    select_cols = ", ".join(f"{col_map[c]} AS {c}" for c in columns if c in col_map)
+    if not select_cols:
+        return df
+
+    if join_key.lower() in ("siren",):
+        join_condition = f"u.SIREN IN ({values_sql})"
+        key_col = "u.SIREN AS _join_key"
+        etab_join = "LEFT JOIN " + _SIRENE_ETAB + " e ON e.SIRET = u.SIREN || u.NIC_SIEGE"
+    else:
+        join_condition = f"e.SIRET IN ({values_sql})"
+        key_col = "e.SIRET AS _join_key"
+        etab_join = "JOIN " + _SIRENE_ETAB + f" e ON e.SIREN = u.SIREN AND e.SIRET IN ({values_sql})"
+
+    query = f"""
+        SELECT {key_col}, {select_cols}
+        FROM {_SIRENE_UL} u
+        {etab_join}
+        WHERE {join_condition}
+    """
+    ref_df = _sf_query(query)
+    if ref_df.empty:
+        return df
+
+    # Merge
+    enriched = df.merge(
+        ref_df.rename(columns={"_join_key": join_key}),
+        on=join_key,
+        how="left",
+        suffixes=("", "_sirene"),
+    )
+    return enriched
+
+
+def _suggest_join_key_ai(columns: list[str]) -> str:
+    """Use Cortex AI to suggest which column is the best join key for SIRENE enrichment."""
+    prompt = (
+        f"Given these DataFrame columns: {columns}\n"
+        f"Which single column is the best join key to match against the French SIRENE register? "
+        f"SIRENE can be joined on SIREN (9 digits) or SIRET (14 digits).\n"
+        f"Return ONLY the exact column name (one word, no quotes, no explanation)."
+    )
+    try:
+        df = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${prompt}$$) AS result")
+        if not df.empty:
+            suggestion = str(df.iloc[0]['result']).strip().strip('"').strip("'")
+            if suggestion in columns:
+                return suggestion
+    except Exception:
+        pass
+    # Fallback: look for siren/siret in column names
+    for col in columns:
+        if "siren" in col.lower():
+            return col
+        if "siret" in col.lower():
+            return col
+    return columns[0] if columns else ""
+
+
+def _render_enrichment_ui():
+    """UI for enriching data with Marketplace SIRENE columns."""
+    _accounts = load_dim_account(_dim_account_fqn())
+    if not _accounts:
+        st.info("Aucune donnée dans DIM_ACCOUNT. Importez des données d'abord.")
+        return
+
+    df = pd.DataFrame(_accounts)
+    available_cols = [c for c in df.columns if c not in ("vat", "country", "legal_form")]
+
+    # Join key selection
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        suggested_key = _suggest_join_key_ai(list(df.columns)) if "siren" not in df.columns else "siren"
+        default_idx = available_cols.index(suggested_key) if suggested_key in available_cols else 0
+        join_key = st.selectbox(
+            "Clé de jointure SIRENE",
+            available_cols,
+            index=default_idx,
+            help="Colonne utilisée pour le rapprochement avec le registre SIRENE. L'IA propose la meilleure option.",
+            key="enrich_join_key",
+        )
+    with col2:
+        selected_cols = st.multiselect(
+            "Colonnes à enrichir",
+            list(SIRENE_ENRICHMENT_COLS.keys()),
+            default=["denomination", "etat_administratif", "activite_principale", "adresse_complete"],
+            format_func=lambda x: SIRENE_ENRICHMENT_COLS.get(x, x),
+            key="enrich_columns",
+        )
+
+    if not selected_cols:
+        st.warning("Sélectionnez au moins une colonne à enrichir.")
+        return
+
+    if st.button("Enrichir avec SIRENE", type="primary", key="btn_enrich"):
+        with st.spinner(f"Enrichissement via SIRENE ({len(df)} lignes × {len(selected_cols)} colonnes)…"):
+            enriched_df = enrich_with_sirene(df, join_key, selected_cols)
+        st.success(f"Enrichissement terminé · {len(enriched_df)} lignes")
+        st.dataframe(enriched_df, use_container_width=True, hide_index=True)
+        csv_data = enriched_df.to_csv(index=False, sep=";")
+        st.download_button(
+            "Télécharger CSV enrichi",
+            csv_data,
+            file_name="donnees_enrichies_sirene.csv",
+            mime="text/csv",
+            key="dl_enriched",
+        )
+
+
+def _render_insee_lookup():
+    """Recherche SIRENE via le registre national Marketplace (29M+ entreprises)."""
+    query = st.text_input(
+        "Recherche SIRENE",
+        placeholder="SIREN, SIRET ou raison sociale…",
+        key="fr_insee_query",
+    )
+    if not query:
+        st.caption("29.6M+ entreprises · Registre national SIRENE (Marketplace Snowflake)")
+        return
+
+    _accounts = load_dim_account(_dim_account_fqn())
+    insee_result = crm_result = None
+    q = query.strip().replace(" ", "")
+    if q.isdigit() and len(q) == 9:
+        insee_result = lookup_sirene(q)
+        crm_result = next((a for a in _accounts if str(a.get("siren", "")) == q), None)
+    elif q.isdigit() and len(q) == 14:
+        siren_code = q[:9]
+        insee_result = lookup_sirene(siren_code)
+        crm_result = next(
+            (a for a in _accounts if str(a.get("siret", "")) == q or str(a.get("siren", "")) == siren_code),
+            None,
+        )
+    else:
+        # Search by name in the Marketplace
+        search_df = _sf_query(f"""
+            SELECT SIREN, DENOMINATION AS raison_sociale, ACTIVITE_PRINCIPALE AS naf,
+                   ETAT_ADMINISTRATIF AS statut, CATEGORIE_JURIDIQUE AS categorie_juridique
+            FROM {_SIRENE_UL}
+            WHERE UPPER(DENOMINATION) LIKE '%{query.upper().replace("'", "''")}%'
+            LIMIT 10
+        """)
+        if not search_df.empty:
+            insee_result = search_df.to_dict("records")[0]
+            if len(search_df) > 1:
+                st.info(f"{len(search_df)} résultats trouvés — affichage du premier.")
+        crm_result = next(
+            (a for a in _accounts if query.lower() in str(a.get("company_name", "")).lower()), None
+        )
+
+    if not insee_result and not crm_result:
+        st.warning("Aucun résultat dans le registre SIRENE.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if insee_result:
+            card(
+                f'<strong>INSEE · {html.escape(insee_result["raison_sociale"])}</strong><br>'
+                f'SIREN {html.escape(insee_result["siren"])} · NAF {html.escape(insee_result["naf"])}<br>'
+                f'{html.escape(insee_result["adresse"])}'
+            )
+    with c2:
+        if crm_result:
+            card(
+                f'<strong>CRM · {html.escape(crm_result["company_name"])}</strong><br>'
+                f'SIREN {html.escape(crm_result["siren"])} · SIRET {html.escape(crm_result["siret"])}'
+            )
+
+
+def _fr_tab_configurator():
+    st.markdown("#### Exécution batch Snowflake")
+    st.caption("Lancer `SP_EXECUTE_BUSINESS_RULES()` sur la table configurée dans **Source & analyse**")
+
+    table = _dim_account_fqn()
+    card(
+        f'<strong>Table configurée</strong> · <code>{html.escape(table)}</code><br>'
+        f'<span style="color:var(--text-secondary);font-size:0.85rem;">'
+        f'Configurez d\'abord la source dans l\'onglet <strong>Source & analyse</strong>, '
+        f'puis lancez la procédure stockée ici (connexion Snowflake à brancher).</span>'
+    )
+
+    if st.button("Lancer SP_EXECUTE_BUSINESS_RULES()", type="primary", key="fr_run_sp"):
+        with st.spinner("Appel CALL SP_EXECUTE_BUSINESS_RULES()…"):
+            sp_result = call_sp_business_rules(table)
+        if sp_result.startswith("Erreur"):
+            st.error(sp_result)
+        else:
+            st.success(f"Procédure exécutée · {sp_result}")
+            add_audit_entry("SP exécutée", f"SP_EXECUTE_BUSINESS_RULES({table})")
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Tab: Règles métier (Custom Rules)
+# ---------------------------------------------------------------------------
+
+
+
+def _fr_tab_custom_rules():
+    """Rules catalog page — dense table format with search, filters, and suspect detection."""
+    t = get_theme()
+    accent = t['accent']
+
+    # ==================== DATA ====================
+    all_std_rules = FR_BUSINESS_RULES + [{"id": "INSEE", "name": "Croisement INSEE", "check": "Confirme l'existence et le statut dans le registre Sirene."}]
+    if "std_rule_toggles" not in st.session_state:
+        st.session_state["std_rule_toggles"] = {r["id"]: True for r in all_std_rules}
+    custom_rules = list_custom_rules(active_only=False)
+
+    # Field mapping for standard rules
+    _std_fields = {"R01": "siren", "R02": "siret", "R03": "siret", "R04": "tva", "R05": "country", "R06": "naf", "R07": "legal_form", "R08": "siren", "INSEE": "siren"}
+    _std_types = {"R01": "Format", "R02": "Format", "R03": "Cohérence", "R04": "Format", "R05": "Référentiel", "R06": "Format", "R07": "Obligatoire", "R08": "Format", "INSEE": "Référentiel"}
+    _std_sevs = {"R01": "HIGH", "R02": "HIGH", "R03": "HIGH", "R04": "HIGH", "R05": "LOW", "R06": "MEDIUM", "R07": "MEDIUM", "R08": "MEDIUM", "INSEE": "HIGH"}
+
+    # Suspect detection: field name vs rule type mismatch
+    _suspect_map = {"email": {"siren", "siret", "naf", "country", "legal_form"}, "telephone": {"siren", "siret", "naf", "vat"}, "tel": {"siren", "siret", "naf", "vat"}}
+    def _is_suspect(rule):
+        name_lower = (rule.get("name") or "").lower()
+        field = rule.get("target_field") or rule.get("field") or ""
+        for keyword, bad_fields in _suspect_map.items():
+            if keyword in name_lower and field in bad_fields:
+                return True
+        return False
+
+    _n_std = len(all_std_rules)
+    _n_custom = len(custom_rules)
+    _n_total = _n_std + _n_custom
+    _n_active = sum(1 for r in all_std_rules if st.session_state["std_rule_toggles"].get(r["id"], True)) + sum(1 for r in custom_rules if r.get("is_active", True))
+    _n_suspect = sum(1 for r in custom_rules if _is_suspect(r))
+
+    # ==================== HEADER ====================
+    _hdr_left, _hdr_right = st.columns([3, 1])
+    with _hdr_left:
+        st.markdown(
+            f'<div style="margin-bottom:4px;">'
+            f'<div style="font-size:1.6rem;font-weight:800;color:{t["text_primary"]};">Règles de contrôle</div>'
+            f'<div style="font-size:0.82rem;color:{t["text_secondary"]};">{_n_active} règles actives · appliquées à la prochaine analyse.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with _hdr_right:
+        if st.button("+ Ajouter une règle", key="rules_add_btn", type="primary", use_container_width=True):
+            st.session_state["rule_add_mode"] = st.session_state.get("rule_add_mode", "create")
+            st.session_state["_show_add_rules"] = True
+            st.rerun()
+
+    # ==================== SEARCH + FILTER TABS ====================
+    _search_col, _tabs_col = st.columns([2, 3])
+    with _search_col:
+        _search = st.text_input("Rechercher", placeholder="Rechercher une règle, un champ...", key="rules_search", label_visibility="collapsed")
+    with _tabs_col:
+        _filter_options = [f"Toutes  {_n_total}", f"Standard  {_n_std}", f"Personnalisées  {_n_custom}"]
+        if _n_suspect > 0:
+            _filter_options.append(f"À corriger  {_n_suspect}")
+        _filter = st.radio("Filtre", _filter_options, horizontal=True, key="rules_filter", label_visibility="collapsed")
+
+    _show_std = "Toutes" in _filter or "Standard" in _filter
+    _show_custom = "Toutes" in _filter or "Personnalisées" in _filter
+    _show_suspect_only = "corriger" in _filter
+
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+    # ==================== HELPER: render table rows ====================
+    _sev_styles = {
+        "HIGH": "background:#fee2e2;color:#dc2626;",
+        "MEDIUM": "background:#fef3c7;color:#d97706;",
+        "LOW": "background:#d1fae5;color:#059669;",
+    }
+
+    def _render_table_header():
+        return (
+            f'<div style="display:grid;grid-template-columns:1fr 120px 100px 90px 60px;padding:8px 16px;'
+            f'border-bottom:2px solid {t["border"]};margin-bottom:4px;">'
+            f'<span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">RÈGLE</span>'
+            f'<span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">CHAMP</span>'
+            f'<span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">TYPE</span>'
+            f'<span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">SÉVÉRITÉ</span>'
+            f'<span style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{t["text_secondary"]};">ACTIF</span>'
+            f'</div>'
+        )
+
+    def _render_row_html(rid, name, desc, field, rtype, severity, is_suspect_row=False, badge_color="#059669"):
+        _field_label = IMPORT_FIELD_LABELS.get(field, field) if field else "—"
+        _sev_style = _sev_styles.get(severity, "background:#e5e7eb;color:#6b7280;")
+        _suspect_badge = '<span style="font-size:0.62rem;font-weight:600;padding:2px 6px;border-radius:4px;background:#fef3c7;color:#d97706;margin-left:8px;">champ suspect</span>' if is_suspect_row else ""
+        _row_bg = "background:rgba(251,191,36,0.06);" if is_suspect_row else ""
+        _field_style = "color:#dc2626;" if is_suspect_row else f"color:{t['text_primary']};"
+        _field_warn = " ⚠" if is_suspect_row else ""
+        return (
+            f'<div style="display:grid;grid-template-columns:1fr 120px 100px 90px 60px;padding:14px 16px;'
+            f'border-bottom:1px solid {t["border_subtle"]};align-items:center;{_row_bg}">'
+            f'<div style="display:flex;align-items:center;gap:12px;">'
+            f'<div style="width:42px;height:42px;border-radius:50%;background:rgba({_hex_to_rgb(badge_color)},0.1);'
+            f'display:flex;align-items:center;justify-content:center;flex-shrink:0;">'
+            f'<span style="font-size:0.7rem;font-weight:800;color:{badge_color};">{html.escape(rid)}</span></div>'
+            f'<div>'
+            f'<div style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">{html.escape(name)}{_suspect_badge}</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:2px;line-height:1.4;">{html.escape(desc)}</div>'
+            f'</div></div>'
+            f'<span style="font-size:0.75rem;font-family:monospace;padding:3px 8px;border-radius:4px;'
+            f'background:{t["border_subtle"]};{_field_style}">{html.escape(_field_label)}{_field_warn}</span>'
+            f'<span style="font-size:0.78rem;color:{t["text_primary"]};">{html.escape(rtype)}</span>'
+            f'<span style="font-size:0.68rem;font-weight:700;padding:3px 8px;border-radius:4px;{_sev_style}">{html.escape(severity)}</span>'
+            f'<div></div>'  # Toggle placeholder (rendered separately by Streamlit)
+            f'</div>'
+        )
+
+    # ==================== STANDARD RULES SECTION ====================
+    if _show_std and not _show_suspect_only:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
+            f'<span style="font-size:1rem;font-weight:700;color:{t["text_primary"]};">Règles standard</span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{_n_std} · non modifiables</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(_render_table_header(), unsafe_allow_html=True)
+
+        for rule in all_std_rules:
+            rid = rule["id"]
+            _name = rule["name"]
+            _desc = rule["check"]
+            _field = _std_fields.get(rid, "")
+            _rtype = _std_types.get(rid, "Format")
+            _sev = _std_sevs.get(rid, "HIGH")
+
+            # Search filter
+            if _search:
+                _q = _search.lower()
+                if _q not in _name.lower() and _q not in _desc.lower() and _q not in _field.lower() and _q not in rid.lower():
+                    continue
+
+            _row_col, _toggle_col = st.columns([11, 1])
+            with _row_col:
+                st.markdown(_render_row_html(rid, _name, _desc, _field, _rtype, _sev, badge_color="#059669"), unsafe_allow_html=True)
+            with _toggle_col:
+                _is_on = st.session_state["std_rule_toggles"].get(rid, True)
+                _new_val = st.toggle("", value=_is_on, key=f"std_toggle_{rid}")
+                if _new_val != _is_on:
+                    st.session_state["std_rule_toggles"][rid] = _new_val
+                    st.rerun()
+
+        st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+
+    # ==================== CUSTOM RULES SECTION ====================
+    if _show_custom or _show_suspect_only:
+        _display_custom = custom_rules
+        if _show_suspect_only:
+            _display_custom = [r for r in custom_rules if _is_suspect(r)]
+
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+            f'<span style="font-size:1rem;font-weight:700;color:{t["text_primary"]};">Règles personnalisées</span>'
+            f'<span style="font-size:0.75rem;color:{t["text_secondary"]};">{len(_display_custom)} · importées</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        if _display_custom:
+            st.markdown(_render_table_header(), unsafe_allow_html=True)
+
+            for i, cr in enumerate(_display_custom):
+                _cid = cr.get("id", f"C{i:02d}")
+                _name = cr.get("name", "")
+                _desc = cr.get("description", cr.get("pattern", ""))
+                _field = cr.get("target_field", cr.get("field", ""))
+                _rtype = RULE_TYPES.get(cr.get("rule_type", ""), cr.get("rule_type", ""))
+                _sev = cr.get("severity", "MEDIUM")
+                _is_active = cr.get("is_active", True)
+                _suspect = _is_suspect(cr)
+
+                # Search filter
+                if _search:
+                    _q = _search.lower()
+                    if _q not in _name.lower() and _q not in _desc.lower() and _q not in _field.lower() and _q not in _cid.lower():
+                        continue
+
+                _row_col, _toggle_col = st.columns([11, 1])
+                with _row_col:
+                    st.markdown(_render_row_html(_cid, _name, _desc, _field, _rtype, _sev, is_suspect_row=_suspect, badge_color="#6366f1"), unsafe_allow_html=True)
+                with _toggle_col:
+                    _new_val = st.toggle("", value=_is_active, key=f"ctoggle_{_cid}")
+                    if _new_val != _is_active:
+                        toggle_custom_rule(cr["id"], _new_val)
+                        st.rerun()
+        else:
+            st.markdown(
+                f'<div style="background:{t["card_bg"]};border:1px dashed {t["border"]};border-radius:10px;padding:30px;text-align:center;color:{t["text_secondary"]};font-size:0.85rem;">'
+                f'Aucune règle personnalisée.'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+
+
+def _hex_to_rgb(hex_color):
+    """Convert #RRGGBB to 'R,G,B' string for use in rgba()."""
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
+    return "0,0,0"
+
+
+def _fr_tab_custom_rules_add_section():
+    """Add rules section — create or import."""
+    t = get_theme()
+    accent = t['accent']
+
+    # Show only when toggled by the button
+    if not st.session_state.get("_show_add_rules"):
+        return
+
+    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">'
+        f'<span style="font-size:1.1rem;">&#x2795;</span>'
+        f'<div>'
+        f'<div style="font-size:1rem;font-weight:700;color:{t["text_primary"]};">Ajouter des règles</div>'
+        f'<div style="font-size:0.78rem;color:{t["text_secondary"]};">Créez manuellement ou importez un fichier de règles analysé par IA.</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Tab selector: Créer / Importer
+    if "rule_add_mode" not in st.session_state:
+        st.session_state["rule_add_mode"] = "create"
+
+    tab_c1, tab_c2, _ = st.columns([1, 1, 3])
+    with tab_c1:
+        if st.button("Créer une règle", key="tab_create_rule",
+                     type="primary" if st.session_state["rule_add_mode"] == "create" else "secondary",
+                     use_container_width=True):
+            st.session_state["rule_add_mode"] = "create"
+            st.rerun()
+    with tab_c2:
+        if st.button("Importer un fichier de règles", key="tab_import_rules",
+                     type="primary" if st.session_state["rule_add_mode"] == "import" else "secondary",
+                     use_container_width=True):
+            st.session_state["rule_add_mode"] = "import"
+            st.rerun()
+
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+    # --- CREATE MODE ---
+    if st.session_state["rule_add_mode"] == "create":
+        with st.form("add_custom_rule_form", clear_on_submit=True):
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                rule_name = st.text_input("Nom de la règle", placeholder="Ex: Email corporate valide")
+                rule_field = st.selectbox(
+                    "Champ cible",
+                    options=list(IMPORT_FIELD_LABELS.keys()),
+                    format_func=lambda k: IMPORT_FIELD_LABELS[k],
+                )
+            with fc2:
+                rule_type = st.selectbox(
+                    "Type de contrôle",
+                    options=list(RULE_TYPES.keys()),
+                    format_func=lambda k: RULE_TYPES[k],
+                )
+                rule_severity = st.selectbox("Sévérité", ["HIGH", "MEDIUM", "LOW"])
+
+            rule_pattern = st.text_input(
+                "Pattern / valeurs",
+                help="Regex pour 'regex', valeurs séparées par virgule pour 'in_list', format min:max pour 'length'. Vide pour 'not_empty'.",
+            )
+            rule_desc = st.text_input("Description (optionnel)", placeholder="Vérifie que l'email est au format standard")
+
+            submitted = st.form_submit_button("Créer la règle", type="primary", use_container_width=True)
+            if submitted and rule_name.strip():
+                cid = create_custom_rule(
+                    name=rule_name.strip(),
+                    target_field=rule_field,
+                    rule_type=rule_type,
+                    pattern=rule_pattern.strip(),
+                    severity=rule_severity,
+                    description=rule_desc.strip(),
+                )
+                st.success(f"Règle **{cid}** créée et persistée sur Snowflake.")
+                st.rerun()
+
+    # --- IMPORT MODE ---
+    else:
+        st.markdown(
+            f'<div style="border:2px dashed {t["border"]};border-radius:12px;padding:30px 20px;text-align:center;'
+            f'background:{t["card_bg"]};margin-bottom:12px;">'
+            f'<div style="font-size:2rem;margin-bottom:8px;">&#x1F4C4;</div>'
+            f'<div style="font-size:0.85rem;font-weight:600;color:{t["text_primary"]};">Déposez votre fichier de règles</div>'
+            f'<div style="font-size:0.75rem;color:{t["text_secondary"]};margin-top:4px;">CSV, Excel, JSON ou texte libre — l\'IA extraira les règles automatiquement</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        uploaded_rules_file = st.file_uploader(
+            "Fichier de règles", type=["csv", "xlsx", "xls", "txt", "json"],
+            key="rules_file_upload", label_visibility="collapsed"
+        )
+
+        # Process uploaded file with AI (skip if already processed)
+        if uploaded_rules_file is not None:
+            _cat_processed = st.session_state.get("_catalog_rules_file_processed")
+            if _cat_processed == uploaded_rules_file.name:
+                st.info(f"Fichier **{uploaded_rules_file.name}** déjà importé. Supprimez-le (×) pour en charger un autre.")
+            else:
+                _process_rules_file_upload(uploaded_rules_file, t, accent)
+                st.session_state["_catalog_rules_file_processed"] = uploaded_rules_file.name
+
+
+def _process_rules_file_upload(uploaded_file, t, accent):
+    """Process an uploaded rules file: parse with AI and show preview table."""
+    import io
+
+    # Read file content
+    file_content = ""
+    fname = uploaded_file.name.lower()
+    if fname.endswith(".csv"):
+        file_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
+    elif fname.endswith((".xlsx", ".xls")):
+        try:
+            import pandas as pd
+            df_rules = pd.read_excel(uploaded_file)
+            file_content = df_rules.to_csv(index=False)
+        except Exception as e:
+            st.error(f"Erreur lecture Excel: {e}")
+            return
+    else:
+        file_content = uploaded_file.getvalue().decode("utf-8", errors="replace")
+
+    # AI extraction with Cortex
+    if "parsed_rules_import" not in st.session_state or st.session_state.get("_rules_file_name") != uploaded_file.name:
+        with st.spinner("Analyse IA du fichier de règles..."):
+            system_prompt = (
+                "Tu es un assistant spécialisé dans la qualité des données B2B. "
+                "L'utilisateur te fournit un fichier contenant des règles métier (format libre, CSV, texte, tableau...). "
+                "Ton rôle est d'extraire chaque règle et de la structurer en JSON.\n\n"
+                "Pour chaque règle identifiée, retourne un objet JSON avec :\n"
+                "- \"nom\" : nom court de la règle\n"
+                "- \"champ\" : le champ cible parmi [siren, siret, company_name, vat, address, city, naf, country, account_id, legal_form, email, phone]\n"
+                "- \"type\" : le type de contrôle parmi [regex, not_empty, in_list, length]\n"
+                "- \"pattern\" : le pattern ou valeurs (vide si not_empty)\n"
+                "- \"severite\" : HIGH, MEDIUM ou LOW\n\n"
+                "Retourne UNIQUEMENT un tableau JSON valide (pas de texte autour). Exemple :\n"
+                '[{"nom":"Email valide","champ":"email","type":"regex","pattern":"^[\\\\w.-]+@[\\\\w.-]+\\\\.[a-z]{2,}$","severite":"HIGH"}]'
+            )
+            prompt = f"{system_prompt}\n\nFichier de règles :\n```\n{file_content[:3000]}\n```"
+            prompt_safe = prompt.replace("'", "''").replace("$$", "$ $")
+            try:
+                result = _sf_query(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', $${prompt_safe}$$) AS r")
+                if result is not None and not result.empty:
+                    raw = result.iloc[0, 0]
+                    import json as _json
+                    # Extract JSON array from response
+                    raw_str = str(raw).strip()
+                    start = raw_str.find("[")
+                    end = raw_str.rfind("]") + 1
+                    if start >= 0 and end > start:
+                        parsed = _json.loads(raw_str[start:end])
+                        st.session_state["parsed_rules_import"] = parsed
+                        st.session_state["_rules_file_name"] = uploaded_file.name
+                    else:
+                        st.session_state["parsed_rules_import"] = []
+                        st.error("L'IA n'a pas pu extraire de règles valides.")
+                else:
+                    st.session_state["parsed_rules_import"] = []
+            except Exception as e:
+                st.error(f"Erreur Cortex AI: {e}")
+                st.session_state["parsed_rules_import"] = []
+
+    parsed_rules = st.session_state.get("parsed_rules_import", [])
+
+    if parsed_rules:
+        st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">'
+            f'<span style="font-size:0.9rem;">&#x2728;</span>'
+            f'<span style="font-size:0.88rem;font-weight:700;color:{t["text_primary"]};">Règles extraites par l\'IA</span>'
+            f'<span style="font-size:0.72rem;padding:2px 8px;border-radius:10px;background:{t.get("accent_soft","rgba(0,200,150,0.08)")};'
+            f'color:{accent};font-weight:600;">{len(parsed_rules)} règles</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Table header
+        table_html = (
+            f'<div style="overflow-x:auto;border-radius:10px;border:1px solid {t["border"]};">'
+            f'<table style="width:100%;border-collapse:collapse;font-size:0.78rem;">'
+            f'<thead><tr style="background:{t["card_bg"]};border-bottom:1px solid {t["border"]};">'
+            f'<th style="padding:10px 12px;text-align:left;color:{t["text_secondary"]};font-weight:600;">NOM</th>'
+            f'<th style="padding:10px 12px;text-align:left;color:{t["text_secondary"]};font-weight:600;">CHAMP</th>'
+            f'<th style="padding:10px 12px;text-align:left;color:{t["text_secondary"]};font-weight:600;">TYPE</th>'
+            f'<th style="padding:10px 12px;text-align:left;color:{t["text_secondary"]};font-weight:600;">SÉVÉRITÉ</th>'
+            f'<th style="padding:10px 12px;text-align:left;color:{t["text_secondary"]};font-weight:600;">PATTERN</th>'
+            f'<th style="padding:10px 12px;text-align:center;color:{t["text_secondary"]};font-weight:600;">STATUT</th>'
+            f'</tr></thead><tbody>'
+        )
+
+        sev_colors = {"HIGH": ("#fee2e2", "#ef4444"), "MEDIUM": ("#fef3c7", "#f59e0b"), "LOW": ("#d1fae5", "#10b981")}
+        valid_fields = list(IMPORT_FIELD_LABELS.keys()) + ["email", "phone"]
+        valid_types = list(RULE_TYPES.keys())
+
+        for rule in parsed_rules:
+            nom = html.escape(str(rule.get("nom", "")))
+            champ = str(rule.get("champ", ""))
+            rtype = str(rule.get("type", ""))
+            pattern = html.escape(str(rule.get("pattern", "")))
+            sev = str(rule.get("severite", "MEDIUM")).upper()
+            sev_bg, sev_fg = sev_colors.get(sev, ("#e5e7eb", "#6b7280"))
+
+            # Validation
+            is_valid = champ in valid_fields and rtype in valid_types and sev in ["HIGH", "MEDIUM", "LOW"]
+            status_html = (
+                f'<span style="color:#10b981;font-weight:700;">&#x2713;</span>' if is_valid
+                else f'<span style="color:#ef4444;font-weight:700;">&#x2717;</span>'
+            )
+
+            field_label = IMPORT_FIELD_LABELS.get(champ, champ)
+            type_label = RULE_TYPES.get(rtype, rtype)
+
+            table_html += (
+                f'<tr style="border-bottom:1px solid {t["border"]};">'
+                f'<td style="padding:10px 12px;color:{t["text_primary"]};font-weight:500;">{nom}</td>'
+                f'<td style="padding:10px 12px;"><span style="font-size:0.68rem;padding:2px 8px;border-radius:4px;'
+                f'background:{t.get("accent_soft","rgba(0,200,150,0.08)")};color:{accent};font-weight:600;">'
+                f'{html.escape(field_label)}</span></td>'
+                f'<td style="padding:10px 12px;"><span style="font-size:0.68rem;padding:2px 8px;border-radius:4px;'
+                f'background:rgba(99,102,241,0.1);color:#6366f1;font-weight:600;">{html.escape(type_label)}</span></td>'
+                f'<td style="padding:10px 12px;"><span style="font-size:0.68rem;padding:2px 8px;border-radius:4px;'
+                f'background:{sev_bg};color:{sev_fg};font-weight:600;">{html.escape(sev)}</span></td>'
+                f'<td style="padding:10px 12px;color:{t["text_secondary"]};font-family:monospace;font-size:0.72rem;">{pattern if pattern else "—"}</td>'
+                f'<td style="padding:10px 12px;text-align:center;">{status_html}</td>'
+                f'</tr>'
+            )
+
+        table_html += '</tbody></table></div>'
+        st.markdown(table_html, unsafe_allow_html=True)
+
+        # Import button
+        st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        valid_count = sum(
+            1 for r in parsed_rules
+            if str(r.get("champ", "")) in valid_fields
+            and str(r.get("type", "")) in valid_types
+            and str(r.get("severite", "")).upper() in ["HIGH", "MEDIUM", "LOW"]
+        )
+
+        _, btn_col, _ = st.columns([1, 2, 1])
+        with btn_col:
+            if st.button(f"Importer les {valid_count} règles", type="primary", use_container_width=True, key="import_parsed_rules"):
+                imported = 0
+                for rule in parsed_rules:
+                    champ = str(rule.get("champ", ""))
+                    rtype = str(rule.get("type", ""))
+                    sev = str(rule.get("severite", "MEDIUM")).upper()
+                    if champ in valid_fields and rtype in valid_types and sev in ["HIGH", "MEDIUM", "LOW"]:
+                        create_custom_rule(
+                            name=str(rule.get("nom", "Règle importée")),
+                            target_field=champ,
+                            rule_type=rtype,
+                            pattern=str(rule.get("pattern", "")),
+                            severity=sev,
+                            description="",
+                        )
+                        imported += 1
+                st.session_state.pop("parsed_rules_import", None)
+                st.session_state.pop("_rules_file_name", None)
+                st.success(f"{imported} règles importées avec succès !")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Tab: Data Cleaning (auto-dedup + scoring + preview)
+# ---------------------------------------------------------------------------
+
+def _fr_tab_data_cleaning():
+    t = get_theme()
+    accent = t['accent']
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Data Cleaning</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Dédoublonnage Cortex AI puis analyse des anomalies sur données propres.</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Use uploaded file if available, otherwise load from Snowflake
+    if st.session_state.get("source_mode") == "file" and "uploaded_df" in st.session_state:
+        df = st.session_state["uploaded_df"].copy()
+        table = st.session_state.get("uploaded_filename", "Fichier uploadé")
+        st.info(f"📂 Source : **{table}** ({len(df)} lignes)")
+    else:
+        table = _dim_account_fqn()
+        raw_data = load_dim_account(table)
+        if not raw_data:
+            st.warning("Aucune donnée dans la table source.")
+            return
+        df = pd.DataFrame(raw_data)
+    mapping = _mapping_for_table(table, list(df.columns))
+
+    # Track current step
+    if "dc_step" not in st.session_state:
+        st.session_state["dc_step"] = 1
+
+    step = st.session_state["dc_step"]
+
+    # --- Step indicator ---
+    steps_html = ""
+    labels = ["Détection doublons", "Confirmation cleaning", "Analyse anomalies"]
+    for i, label in enumerate(labels, 1):
+        cls = "qx-step-done" if i < step else ("qx-step-active" if i == step else "qx-step-pending")
+        icon = "✓" if i < step else str(i)
+        steps_html += f'<span class="qx-step {cls}">{icon} {label}</span> '
+    st.markdown(f'<div class="qx-wizard-track">{steps_html}</div>', unsafe_allow_html=True)
+
+    # =========================================================================
+    # STEP 1: Detect duplicates with Cortex AI
+    # =========================================================================
+    if step == 1:
+        st.markdown(f"**Table :** `{table}` · **{len(df)} lignes**")
+        st.markdown("Cortex AI compare les enregistrements et identifie les doublons (SIREN identiques, noms similaires, adresses proches).")
+
+        if st.button("Lancer la détection", type="primary", key="dc_detect", use_container_width=True):
+            with st.spinner("Cortex AI analyse les doublons…"):
+                comp_col = mapping.get("company_name") or "COMPANY_NAME"
+                siren_col = mapping.get("siren") or "SIREN"
+                id_col = mapping.get("account_id") or "ACCOUNT_ID"
+                addr_col = mapping.get("address") or "ADDRESS"
+
+                records_for_ai = []
+                for idx, row in df.iterrows():
+                    records_for_ai.append({
+                        "idx": int(idx),
+                        "id": _cell_str(row[id_col]) if id_col in row.index else str(idx),
+                        "name": _cell_str(row[comp_col]) if comp_col in row.index else "",
+                        "siren": _cell_str(row[siren_col]) if siren_col in row.index else "",
+                        "address": _cell_str(row[addr_col]) if addr_col in row.index else "",
+                    })
+
+                # Cortex AI has token limits — process in batches of 200 records max
+                _batch_size = 200
+                all_duplicate_groups = []
+                _group_offset = 0
+                for _batch_start in range(0, len(records_for_ai), _batch_size):
+                    _batch = records_for_ai[_batch_start:_batch_start + _batch_size]
+                    records_json = json.dumps(_batch, ensure_ascii=False)
+                    prompt = f"""Tu es un expert data quality. Analyse ces enregistrements et identifie les GROUPES DE DOUBLONS.
+Criteres :
+- SIREN identique (meme apres nettoyage espaces/tirets)
+- Noms tres similaires (abreviations, inversions, casse)
+- Meme adresse avec nom legerement different
+
+Enregistrements :
+{records_json}
+
+Reponds UNIQUEMENT en JSON valide, un array de groupes :
+[{{"group_id": 1, "records": [idx1, idx2], "confidence": 0.95, "reason": "SIREN identique"}}]
+Si aucun doublon : []
+JSON :"""
+
+                    try:
+                        cortex_result = _sf_query(f"""
+                            SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{prompt.replace("'", "''")}') AS result
+                        """)
+                        if not cortex_result.empty:
+                            raw_response = str(cortex_result.iloc[0, 0])
+                            json_match = re.search(r'\[.*\]', raw_response, re.DOTALL)
+                            if json_match:
+                                _batch_groups = json.loads(json_match.group())
+                                for g in _batch_groups:
+                                    g["group_id"] = g.get("group_id", 0) + _group_offset
+                                all_duplicate_groups.extend(_batch_groups)
+                    except Exception:
+                        pass  # Continue with next batch
+                    _group_offset += 1000
+
+                duplicate_groups = all_duplicate_groups
+
+                st.session_state["dc_groups"] = duplicate_groups
+                st.session_state["dc_df"] = df
+                st.session_state.pop("dc_merged_df", None)
+                st.session_state.pop("dc_anomalies", None)
+
+                if duplicate_groups:
+                    st.session_state["dc_step"] = 2
+                else:
+                    # No duplicates — skip to analysis directly
+                    st.session_state["dc_merged_df"] = df
+                    st.session_state["dc_step"] = 3
+            st.rerun()
+
+    # =========================================================================
+    # STEP 2: Show groups + user confirms cleaning
+    # =========================================================================
+    elif step == 2:
+        groups = st.session_state.get("dc_groups", [])
+        st.success(f"**{len(groups)} groupe(s) de doublons** détectés")
+
+        for i, group in enumerate(groups):
+            record_indices = group.get("records", [])
+            confidence = group.get("confidence", 0)
+            reason = group.get("reason", "")
+            with st.expander(f"Groupe {i+1} — {reason} (confiance {confidence*100:.0f}%)", expanded=True):
+                group_rows = df.iloc[record_indices] if all(idx < len(df) for idx in record_indices) else pd.DataFrame()
+                if not group_rows.empty:
+                    st.dataframe(group_rows, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("**Confirmer le nettoyage ?** Cortex va fusionner chaque groupe en un seul enregistrement optimal.")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Confirmer et fusionner", type="primary", key="dc_confirm_merge", use_container_width=True):
+                with st.spinner("Cortex AI fusionne les doublons…"):
+                    merged_rows = []
+                    removed_indices = set()
+
+                    for group in groups:
+                        record_indices = group.get("records", [])
+                        if len(record_indices) < 2:
+                            continue
+                        group_rows = df.iloc[record_indices]
+                        group_data = group_rows.to_dict("records")
+                        cols = list(df.columns)
+
+                        merge_prompt = f"""Fusionne ces doublons en UN seul enregistrement optimal.
+Colonnes : {json.dumps(cols)}
+Enregistrements :
+{json.dumps(group_data, ensure_ascii=False, default=str)}
+
+Regles : garder SIREN/SIRET valide (9/14 chiffres), nom le plus complet, adresse la plus complete, NAF format XXXXZ.
+Reponds UNIQUEMENT en JSON — un seul objet :
+JSON :"""
+
+                        try:
+                            merge_result = _sf_query(f"""
+                                SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', '{merge_prompt.replace("'", "''")}') AS result
+                            """)
+                            if not merge_result.empty:
+                                raw_merge = str(merge_result.iloc[0, 0])
+                                json_match = re.search(r'\{.*\}', raw_merge, re.DOTALL)
+                                if json_match:
+                                    merged_record = json.loads(json_match.group())
+                                    merged_rows.append((record_indices[0], merged_record))
+                                    removed_indices.update(record_indices[1:])
+                                else:
+                                    removed_indices.update(record_indices[1:])
+                            else:
+                                removed_indices.update(record_indices[1:])
+                        except Exception:
+                            removed_indices.update(record_indices[1:])
+
+                    # Build cleaned DataFrame
+                    df_cleaned = df.drop(index=list(removed_indices)).reset_index(drop=True)
+                    for keep_idx, merged_record in merged_rows:
+                        mask = df_cleaned.index == keep_idx
+                        if mask.any():
+                            for col_name, val in merged_record.items():
+                                if col_name in df_cleaned.columns:
+                                    df_cleaned.loc[mask, col_name] = val
+
+                    run_id = f"CORTEX-DEDUP-{_now().strftime('%Y%m%d%H%M%S')}"
+                    persist_dedup_result(run_id, table, len(df), len(df_cleaned), len(removed_indices), ["cortex_ai"], "merge_intelligent", 0.0)
+                    add_audit_entry("Cleaning Cortex", f"{len(removed_indices)} doublons fusionnes sur {table}")
+
+                    st.session_state["dc_merged_df"] = df_cleaned
+                    st.session_state["dc_removed_count"] = len(removed_indices)
+                    st.session_state["dc_run_id"] = run_id
+                    st.session_state["dc_step"] = 3
+                st.rerun()
+        with c2:
+            if st.button("Ignorer les doublons", key="dc_skip_merge", use_container_width=True):
+                st.session_state["dc_merged_df"] = df
+                st.session_state["dc_removed_count"] = 0
+                st.session_state["dc_step"] = 3
+                st.rerun()
+
+    # =========================================================================
+    # STEP 3: Run analysis on cleaned data + show results
+    # =========================================================================
+    elif step == 3:
+        df_clean = st.session_state.get("dc_merged_df", df)
+        removed_count = st.session_state.get("dc_removed_count", 0)
+
+        if removed_count > 0:
+            st.success(f"Cleaning terminé : **{removed_count} doublon(s)** fusionnés. Données nettoyées : **{len(df_clean)} lignes**.")
+        else:
+            st.info(f"Aucun doublon supprimé. Analyse sur **{len(df_clean)} lignes**.")
+
+        # Run analysis if not already done
+        if "dc_anomalies" not in st.session_state:
+            with st.spinner("Analyse des anomalies (R01-R08 + INSEE) sur données nettoyées…"):
+                custom_rules_db = [
+                    {"id": r["id"], "name": r["name"], "field": r["target_field"],
+                     "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+                     "rule_type": r.get("rule_type", "regex")}
+                    for r in list_custom_rules(active_only=True)
+                ]
+                enabled = [r["id"] for r in FR_BUSINESS_RULES] + ["INSEE"]
+                anomalies, stats = analyze_uploaded_dataframe(
+                    df_clean, mapping, source="snowflake",
+                    enabled_rules=enabled, skip_duplicate_check=True,
+                    custom_rules=custom_rules_db, skip_name_search=True,
+                )
+                st.session_state["dc_anomalies"] = anomalies
+                st.session_state["dc_stats"] = stats
+                st.session_state["_dc_deferred_enrichment"] = {
+                    "df": df_clean, "mapping": mapping,
+                    "enabled_rules": enabled, "custom_rules": custom_rules_db,
+                }
+
+        anomalies = st.session_state["dc_anomalies"]
+        stats = st.session_state["dc_stats"]
+
+        # Deferred name enrichment
+        _dc_def = st.session_state.pop("_dc_deferred_enrichment", None)
+        if _dc_def:
+            with st.spinner("Enrichissement INSEE par nom..."):
+                try:
+                    _extra, _ = analyze_uploaded_dataframe(
+                        _dc_def["df"], _dc_def["mapping"], source="snowflake",
+                        enabled_rules=_dc_def["enabled_rules"], skip_duplicate_check=True,
+                        custom_rules=_dc_def.get("custom_rules", []), skip_name_search=False,
+                    )
+                    _existing = {a["id"] for a in anomalies}
+                    _new = [a for a in _extra if a["id"] not in _existing]
+                    if _new:
+                        anomalies.extend(_new)
+                        st.session_state["dc_anomalies"] = anomalies
+                        stats["anomaly_count"] = stats.get("anomaly_count", 0) + len(_new)
+                        st.session_state["dc_stats"] = stats
+                        st.toast(f"+{len(_new)} anomalie(s) enrichie(s) via nom INSEE")
+                except Exception:
+                    pass
+
+
+        # --- Confidence scoring per row ---
+        st.markdown("---")
+        st.markdown("#### Score de confiance par ligne")
+        st.caption("Chaque ligne reçoit un score basé sur le ratio règles passées / règles applicables.")
+
+        # Compute per-row scores
+        active_custom = list_custom_rules(active_only=True)
+        custom_for_scoring = [
+            {"id": r["id"], "name": r["name"], "field": r["target_field"],
+             "pattern": r.get("pattern", ""), "severity": r.get("severity", "MEDIUM"),
+             "rule_type": r.get("rule_type", "regex")}
+            for r in active_custom
+        ]
+        row_scores = []
+        for idx, row in df_clean.iterrows():
+            row_num = int(idx) + 1
+            failed_rules = []
+            def _v(field):
+                col = mapping.get(field)
+                return _cell_str(row[col]) if col and col in row.index else ""
+            siren = _digits_only(_v("siren"))
+            siret = _digits_only(_v("siret"))
+            applicable = 0
+            passed = 0
+            if mapping.get("siren"):
+                applicable += 1
+                if siren and _valid_siren(siren):
+                    passed += 1
+                elif not siren:
+                    passed += 0  # missing = fail only if mandatory
+                    failed_rules.append("R01")
+                else:
+                    failed_rules.append("R01")
+            if mapping.get("siret"):
+                applicable += 1
+                if siret and _valid_siret(siret):
+                    passed += 1
+                elif not siret:
+                    failed_rules.append("R02")
+                else:
+                    failed_rules.append("R02")
+            if mapping.get("siren") and mapping.get("siret") and siren and siret and _valid_siren(siren) and _valid_siret(siret):
+                # Only check coherence if both are valid
+                applicable += 1
+                if _siret_matches_siren(siren, siret):
+                    passed += 1
+                else:
+                    failed_rules.append("R03")
+            if mapping.get("vat"):
+                vat_val = _v("vat").upper().replace(" ", "")
+                if vat_val:  # Only score if value exists
+                    applicable += 1
+                    if re.match(r'^FR[0-9A-Z]{11}$', vat_val):
+                        passed += 1
+                    else:
+                        failed_rules.append("R04")
+            if mapping.get("naf"):
+                naf_val = _v("naf").replace(".", "")
+                if naf_val:  # Only score if value exists
+                    applicable += 1
+                    if re.match(r'^[0-9]{4}[A-Za-z]$', naf_val):
+                        passed += 1
+                    else:
+                        failed_rules.append("R06")
+            if mapping.get("legal_form"):
+                lf = _v("legal_form").strip()
+                if lf:  # Only score if value exists
+                    applicable += 1
+                    passed += 1  # has value = pass
+                else:
+                    # Check if extractable from company name
+                    company = _v("company_name")
+                    if _extract_legal_form(company):
+                        pass  # don't penalize, it's in the name
+                    else:
+                        applicable += 1
+                        failed_rules.append("R07")
+            for cr in custom_for_scoring:
+                col = mapping.get(cr["field"])
+                if not col or col not in row.index:
+                    continue
+                applicable += 1
+                raw = _cell_str(row[col])
+                rt = cr.get("rule_type", "regex")
+                pat = cr.get("pattern", "")
+                if rt == "not_empty":
+                    ok = bool(raw.strip())
+                elif rt == "regex":
+                    ok = bool(re.search(pat, raw)) if pat else bool(raw.strip())
+                elif rt == "in_list":
+                    ok = raw.strip().upper() in [v.strip().upper() for v in pat.split(",")]
+                elif rt == "length":
+                    parts = pat.split(":")
+                    mn = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+                    mx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 9999
+                    ok = mn <= len(raw) <= mx
+                else:
+                    ok = True
+                if ok:
+                    passed += 1
+                else:
+                    failed_rules.append(cr["id"])
+            score = round(passed / applicable * 100, 1) if applicable else 100.0
+            row_scores.append({
+                "Compte": _v("company_name")[:25] or _v("account_id") or str(row_num),
+                "Score": score,
+                "Passées": passed,
+                "Total": applicable,
+                "Échouées": ", ".join(failed_rules) if failed_rules else "—",
+            })
+
+        # Summary metrics
+        avg_score = round(sum(s["Score"] for s in row_scores) / len(row_scores), 1) if row_scores else 0
+        high_q = sum(1 for s in row_scores if s["Score"] >= 80)
+        critical = sum(1 for s in row_scores if s["Score"] < 50)
+
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.metric("Score moyen", f"{avg_score}%")
+        with sc2:
+            st.metric("Lignes fiables (≥80%)", f"{high_q}/{len(row_scores)}")
+        with sc3:
+            st.metric("Lignes critiques (<50%)", critical)
+
+        # Per-row table
+        score_df = pd.DataFrame(row_scores)
+        if not score_df.empty:
+            st.dataframe(
+                score_df.style.map(
+                    lambda v: f"background-color: {'#c6efce' if v >= 80 else ('#ffeb9c' if v >= 50 else '#ffc7ce')}"
+                    if isinstance(v, (int, float)) and 0 <= v <= 100 else "",
+                    subset=["Score"],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # --- Preview cleaned data ---
+        with st.expander("Aperçu des données nettoyées", expanded=False):
+            st.dataframe(df_clean, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # --- Actions ---
+        st.markdown("#### Actions")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("Écrire sur Snowflake", type="primary", key="dc_write", use_container_width=True):
+                st.session_state["dc_confirm_write"] = True
+                st.rerun()
+        with c2:
+            if st.button("Recommencer", key="dc_restart", use_container_width=True):
+                for k in ["dc_step", "dc_groups", "dc_merged_df", "dc_anomalies", "dc_stats", "dc_removed_count", "dc_run_id", "dc_confirm_write"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+        with c3:
+            if anomalies:
+                if st.button("Voir dans Résolution", key="dc_to_resolution", use_container_width=True):
+                    st.session_state["fr_upload_anomalies"] = anomalies
+                    st.session_state["fr_upload_stats"] = stats
+                    st.session_state["_goto_fr_resolution"] = True
+                    st.session_state["_fr_active_tab"] = 4
+                    st.rerun()
+
+        # Double confirmation for write
+        if st.session_state.get("dc_confirm_write"):
+            st.error(f"Confirmer l'écriture de **{len(df_clean)} lignes** nettoyées sur `{table}` ? Cette action écrase la table.")
+            wc1, wc2 = st.columns(2)
+            with wc1:
+                if st.button("Confirmer", type="primary", key="dc_confirm_yes"):
+                    with st.spinner("Écriture sur Snowflake…"):
+                        stage_dataframe_to_snowflake(df_clean, table)
+                        load_dim_account.clear()
+                        add_audit_entry("Écriture cleaning", f"{table}: {len(df_clean)} lignes, {removed_count} doublons supprimés")
+                    st.session_state.pop("dc_confirm_write", None)
+                    st.success("Données nettoyées écrites sur Snowflake.")
+                    # Reset
+                    for k in ["dc_step", "dc_groups", "dc_merged_df", "dc_anomalies", "dc_stats", "dc_removed_count"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+            with wc2:
+                if st.button("Annuler", key="dc_confirm_no"):
+                    st.session_state.pop("dc_confirm_write", None)
+                    st.rerun()
+
+
+def _fr_tab_dashboard():
+    t = get_theme()
+    accent = t['accent']
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Tableau de bord France</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Conformité identifiants légaux & préparation e-facturation</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    _dim_accounts = load_dim_account(_dim_account_fqn())
+    n = len(_dim_accounts) if _dim_accounts else 0
+    # Compute from real DQ_FINDINGS
+    _all_findings = get_all_fr_anomalies()
+    _open_findings = [f for f in _all_findings if f["status"] in ("Open", "In Review")]
+    _affected = len({f["account_id"] for f in _open_findings})
+    total_analysed = n
+    fr_score = round((n - _affected) / n * 100) if n else 0
+    # E-invoicing ready = accounts without R01/R02/R03 failures
+    _r123_fails = {f["account_id"] for f in _open_findings if f.get("rule_id") in ("R01", "R02", "R03")}
+    einvoicing_ready = max(0, n - len(_r123_fails))
+    source_label = "Calculé depuis DQ_FINDINGS"
+
+    open_fr = len(_open_findings)
+    st.markdown(
+        '<div class="qx-kpi-grid">'
+        + kpi_card("Score DQ France", f"{fr_score}%", source_label, "neutral")
+        + kpi_card("EINVOICING_READY_COUNT", str(einvoicing_ready), f"sur {total_analysed} comptes FR", "neutral")
+        + kpi_card("Anomalies ouvertes", str(open_fr), "SIREN / SIRET / TVA", "down")
+        + kpi_card("Corrections", str(len(get_fr_corrections())), "DQ_CORRECTIONS", "neutral")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_g, col_sla = st.columns([1, 1.4])
+    with col_g:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=einvoicing_ready,
+            title={"text": "Comptes prêts e-facturation", "font": {"size": 13, "color": t["text_secondary"]}},
+            gauge={
+                "axis": {"range": [0, total_analysed]},
+                "bar": {"color": t["success"]},
+                "steps": [{"range": [0, total_analysed], "color": "rgba(34,197,94,0.1)"}],
+            },
+            number={"suffix": f" / {total_analysed}", "font": {"size": 36, "color": t["text_primary"]}},
+        ))
+        fig = plotly_layout(fig, t, height=260)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_sla:
+        sla_rules = compute_fr_sla(_open_findings, total_analysed)
+        computed_label = " (calculé)" if _open_findings else " (aucune analyse)"
+        st.markdown(f"**SLA · Taux de conformité par règle{computed_label}**")
+        for rule in sla_rules:
+            color = t["success"] if rule["sla_pct"] >= 90 else t["medium"] if rule["sla_pct"] >= 75 else t["high"]
+            st.markdown(
+                f'<div style="margin-bottom:10px;">'
+                f'<div style="display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:4px;">'
+                f'<span><strong>{rule["id"]}</strong> · {html.escape(rule["name"])}</span>'
+                f'<span style="color:{color};font-weight:600;">{rule["sla_pct"]}%</span></div>'
+                f'<div style="background:var(--border);border-radius:4px;height:8px;overflow:hidden;">'
+                f'<div style="width:{rule["sla_pct"]}%;background:{color};height:100%;"></div></div>'
+                f'<div style="font-size:0.75rem;color:var(--text-secondary);margin-top:2px;">'
+                f'{rule["ok"]}/{rule["total"]} conformes · {html.escape(rule["check"])}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    if not _open_findings:
+        st.info(
+            "Lancez une analyse dans l'onglet **Source & Analyse** pour obtenir les SLA et le score calculés "
+            "sur vos données réelles."
+        )
+    else:
+        st.caption(
+            "Validation INSEE SIRENE active · registre national 29.6M+ entreprises (Marketplace Snowflake)"
+        )
+
+
+def _fr_tab_resolution():
+    t = get_theme()
+    accent = t['accent']
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Centre de résolution</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Anomalies SIREN / SIRET / TVA · écriture dans DQ_CORRECTIONS</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    open_anomalies = [a for a in get_all_fr_anomalies() if a["status"] in ("Open", "In Review")]
+    if not open_anomalies:
+        st.success("Aucune anomalie France en attente de résolution.")
+    else:
+        import_count = sum(1 for a in open_anomalies if a.get("source") == "import")
+        if import_count:
+            st.caption(f"{import_count} anomalie(s) provenant d'un import fichier · {len(open_anomalies)} au total")
+
+        def _accept_one(aid):
+            a = next((x for x in open_anomalies if x["id"] == aid), None)
+            if a:
+                fr_resolve_anomaly(aid, "Accepted", corrected_value=a.get("expected_value", ""))
+
+        def _reject_one(aid, reason=""):
+            fr_resolve_anomaly(aid, "Rejected", rejection_reason=reason or "Non applicable")
+
+        _render_bulk_action_table(open_anomalies, _accept_one, _reject_one, key_prefix="fr_res")
+
+        with st.expander("Détail individuel (correction manuelle)", expanded=False):
+            for a in open_anomalies[:20]:
+                source_badge = (
+                    '<span class="qx-badge" style="background:rgba(59,130,246,0.15);color:var(--low);">Fichier</span> '
+                    if a.get("source") == "import" else (
+                    '<span class="qx-badge" style="background:rgba(34,197,94,0.15);color:var(--success);">Table</span> '
+                    if a.get("source") == "snowflake" else "")
+                )
+                row_hint = f' · Ligne {a["row_num"]}' if a.get("row_num") else ""
+                st.markdown(
+                    f'<div class="qx-card">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:10px;">'
+                    f'<div>{severity_badge("HIGH" if a["rule_id"] in ("R01","R02","R03","R04","INSEE") else "MEDIUM")} '
+                    f'{source_badge}'
+                    f'<span class="qx-badge" style="background:var(--accent-soft);color:var(--accent);">{html.escape(a["rule_id"])}</span> '
+                    f'<strong>{html.escape(a["company_name"])}</strong> '
+                    f'<span style="color:var(--text-secondary);">· {html.escape(a["account_id"])}{row_hint}</span></div>'
+                    f'<span style="color:var(--text-secondary);font-size:0.8rem;">{html.escape(a["id"])}</span></div>'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:0.9rem;">'
+                    f'<div style="background:rgba(239,68,68,0.06);padding:10px;border-radius:6px;border:1px solid var(--border);">'
+                    f'<div style="font-size:0.75rem;color:var(--text-secondary);">FIELD_VALUE · {html.escape(a["field_label"])}</div>'
+                    f'<div style="font-weight:600;margin-top:4px;">{html.escape(a["field_value"]) or "—"}</div></div>'
+                    f'<div style="background:rgba(34,197,94,0.06);padding:10px;border-radius:6px;border:1px solid var(--border);">'
+                    f'<div style="font-size:0.75rem;color:var(--text-secondary);">EXPECTED_VALUE</div>'
+                    f'<div style="font-weight:600;margin-top:4px;">{html.escape(a["expected_value"])}</div></div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Accepter & corriger", key=f"fr_acc_{a['id']}", type="primary", use_container_width=True):
+                        st.session_state[f"fr_show_accept_{a['id']}"] = True
+                with c2:
+                    if st.button("Rejeter", key=f"fr_rej_{a['id']}", use_container_width=True):
+                        st.session_state[f"fr_show_reject_{a['id']}"] = True
+
+                if st.session_state.get(f"fr_show_accept_{a['id']}"):
+                    corrected_value = st.text_input(
+                        "Nouvelle valeur",
+                        value=a.get("expected_value", ""),
+                        key=f"fr_corrected_val_{a['id']}",
+                    )
+                    if st.button("Confirmer — écrire sur Snowflake", key=f"fr_confirm_acc_{a['id']}", type="primary"):
+                        fr_resolve_anomaly(a["id"], "Accepted", corrected_value=corrected_value)
+                        st.session_state.pop(f"fr_show_accept_{a['id']}", None)
+                        st.rerun()
+
+                if st.session_state.get(f"fr_show_reject_{a['id']}"):
+                    reason = st.text_input("Motif", key=f"fr_reason_{a['id']}")
+                    if st.button("Confirmer rejet", key=f"fr_confirm_rej_{a['id']}", type="primary"):
+                        fr_resolve_anomaly(a["id"], "Rejected", rejection_reason=reason or "Non applicable")
+                        st.session_state.pop(f"fr_show_reject_{a['id']}", None)
+                        st.rerun()
+                st.markdown("---")
+
+    st.markdown("---")
+    st.markdown("##### Enrichissement INSEE SIRENE")
+    st.caption("Enrichissez vos données avec le registre national (29M+ entreprises)")
+    _render_enrichment_ui()
+
+    with st.expander("Recherche SIRENE"):
+        _render_insee_lookup()
+
+
+def _fr_tab_audit_export():
+    t = get_theme()
+    accent = t['accent']
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<div style="width:3px;height:18px;border-radius:2px;background:{accent};"></div>'
+        f'<div>'
+        f'<div style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">Audit & Export</div>'
+        f'<div style="font-size:0.75rem;color:{t["text_secondary"]};">Corrections acceptées · rapport e-facturation</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    corrections = get_fr_corrections()
+    accepted = [c for c in corrections if c["status"] == "Accepted"]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**CSV UPDATE · corrections CRM**")
+        if accepted:
+            df_corr = pd.DataFrame([{
+                "ACCOUNT_ID": c["account_id"],
+                "FIELD": c["field"],
+                "OLD_VALUE": c["field_value"],
+                "NEW_VALUE": c["expected_value"],
+                "RULE_ID": c["rule_id"],
+                "CORRECTION_STATUS": "READY_FOR_CRM",
+            } for c in accepted])
+            st.dataframe(df_corr, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Télécharger UPDATE corrections",
+                df_corr.to_csv(index=False),
+                file_name="fr_update_corrections.csv",
+                mime="text/csv",
+                key="fr_dl_update",
+            )
+        else:
+            st.caption("Aucune correction acceptée pour l'instant — utilisez le centre de résolution.")
+
+    with col2:
+        st.markdown("**Rapport HTML · e-facturation**")
+        _fr_anom = get_all_fr_anomalies()
+        _total = len(load_dim_account(_dim_account_fqn())) or 1
+        _sla_rules = compute_fr_sla(_fr_anom, _total)
+        _einvoicing = 0
+        for r in _sla_rules:
+            if r.get("rule_id") == "R08":
+                _einvoicing = r.get("ok_count", 0)
+                break
+        _score = round((1 - len(_fr_anom) / max(_total * 7, 1)) * 100, 1)
+        html_report = f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><title>Rapport Léon FR</title></head>
+<body style="font-family:sans-serif;padding:2rem;">
+<h1>Rapport conformité France</h1>
+<p>Généré le {_now().strftime("%d/%m/%Y %H:%M")}</p>
+<ul>
+<li>Score DQ France : <strong>{_score}%</strong></li>
+<li>EINVOICING_READY_COUNT : <strong>{_einvoicing}</strong> / {_total}</li>
+<li>Corrections acceptées : <strong>{len(accepted)}</strong></li>
+<li>Corrections rejetées : <strong>{len(corrections) - len(accepted)}</strong></li>
+</ul>
+<h2>SLA règles R01–R08</h2>
+<ul>
+{"".join(f'<li>{r["id"]} {r["name"]} : {r["sla_pct"]}% ({r["ok"]}/{r["total"]} conformes)</li>' for r in _sla_rules)}
+</ul>
+</body></html>"""
+        st.download_button(
+            "Télécharger rapport HTML",
+            html_report,
+            file_name="rapport_conformite_fr.html",
+            mime="text/html",
+            key="fr_dl_html",
+        )
+        card(
+            f'<strong>Aperçu</strong><br>'
+            f'EINVOICING_READY_COUNT · <strong>{_einvoicing}</strong> / {_total} comptes<br>'
+            f'Score DQ · <strong>{_score}%</strong>'
+        )
+
+    if corrections:
+        st.markdown("**Historique DQ_CORRECTIONS**")
+        hist = pd.DataFrame([{
+            "ID": c["id"],
+            "Anomalie": c["anomaly_id"],
+            "Compte": c["account_id"],
+            "Champ": c["field"],
+            "Action": "Acceptée" if c["status"] == "Accepted" else "Rejetée",
+            "Motif rejet": c["rejection_reason"] or "—",
+            "Horodatage": c["timestamp"],
+        } for c in corrections])
+        st.dataframe(hist, use_container_width=True, hide_index=True)
+
+    # Export certifié INSEE
+    if st.button("Exporter avec statut INSEE vérifié", key="fr_export_insee"):
+        _accounts = load_dim_account(_dim_account_fqn())
+        if _accounts:
+            export_df = pd.DataFrame(_accounts)
+            sirene_cache = load_sirene_cache()
+            export_df["statut_sirene"] = export_df["siren"].apply(
+                lambda s: sirene_cache.get(str(s), {}).get("statut", "Inconnu") if s else "Inconnu"
+            )
+            export_df["statut_sirene"] = export_df["statut_sirene"].map(
+                {"A": "Active", "C": "Radiée"}).fillna(export_df["statut_sirene"])
+            export_df["date_verification_insee"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+            csv_data = export_df.to_csv(index=False, sep=";")
+            st.download_button(
+                "Télécharger CSV (INSEE vérifié)",
+                csv_data,
+                file_name="export_insee_verifie.csv",
+                mime="text/csv",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Page: Historique des analyses
+# ---------------------------------------------------------------------------
+
+def page_history():
+    t = get_theme()
+    accent = t["accent"]
+    history = load_analysis_history()
+
+    # --- Header row: title + "Nouvelle analyse" button ---
+    hdr_l, hdr_r = st.columns([3, 1])
+    with hdr_l:
+        st.markdown(
+            f'<div style="margin-bottom:4px;">'
+            f'<div style="font-size:1.5rem;font-weight:800;color:{t["text_primary"]};">Historique des analyses</div>'
+            f'<div style="font-size:0.82rem;color:{t["text_secondary"]};margin-top:4px;">Rouvrez une analyse passée sans la relancer, ou démarrez-en une nouvelle.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with hdr_r:
+        if st.button("+ Nouvelle analyse", type="primary", use_container_width=True, key="hist_new"):
+            for k in ["wizard_step", "fr_upload_anomalies", "fr_upload_stats", "fr_scan_done",
+                      "wizard_stats", "uploaded_df", "wiz_clean_df", "wizard_uploaded_df",
+                      "viewing_archived_id", "fr_clean_df", "fr_removed_df",
+                      "selected_subjects", "wizard_enabled_rules", "wizard_mapping"]:
+                st.session_state.pop(k, None)
+            st.session_state["page"] = "run_analysis"
+            st.rerun()
+
+    # --- KPI banner ---
+    total_analyses = len(history)
+    sources_distinct = len(set(h.get("source_table", "") for h in history))
+    total_anomalies = sum(h.get("anomaly_count", 0) for h in history)
+    # Score gain this month
+    now = _now()
+    month_entries = [h for h in history if h.get("created_at") and h["created_at"].month == now.month and h["created_at"].year == now.year]
+    _score_gain = 0
+    if month_entries:
+        scores_with_prev = [
+            (int(h["score"]), int(h["score_previous"]))
+            for h in month_entries
+            if h.get("score_previous") is not None and not (isinstance(h.get("score_previous"), float) and pd.isna(h["score_previous"]))
+        ]
+        if scores_with_prev:
+            _score_gain = round(sum(s - p for s, p in scores_with_prev) / len(scores_with_prev))
+
+    st.markdown(
+        '<div class="qx-kpi-grid qx-kpi-grid-auto">'
+        + kpi_card("Analyses réalisées", str(total_analyses), "total", "neutral")
+        + kpi_card("Sources distinctes", str(sources_distinct), "", "neutral")
+        + kpi_card("Anomalies cumulées", str(total_anomalies), "", "neutral")
+        + kpi_card("Score moyen ce mois", f"+{_score_gain} pts" if _score_gain > 0 else f"{_score_gain} pts", "", "up" if _score_gain > 0 else "down")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div style="height:16px;"></div>', unsafe_allow_html=True)
+
+    # --- Date filter (simple date_input inline, like the dashboard) ---
+    _filter_date = st.session_state.get("history_filter_date", None)
+
+    _df_col1, _df_col2 = st.columns([3.5, 1])
+    with _df_col1:
+        st.markdown(
+            f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;color:{t["text_secondary"]};'
+            f'text-transform:uppercase;padding:8px 0 4px;">HISTORIQUE</div>',
+            unsafe_allow_html=True,
+        )
+    with _df_col2:
+        _picked = st.date_input(
+            "Date",
+            value=_filter_date or _now().date(),
+            key="hf_datepicker",
+            label_visibility="collapsed",
+        )
+        if _picked != (_filter_date or _now().date()):
+            st.session_state["history_filter_date"] = _picked
+            st.rerun()
+
+    # --- Filter history entries ---
+    filtered = history
+    if _filter_date:
+        filtered = [h for h in history if h.get("created_at") and h["created_at"].date() == _filter_date]
+
+    # --- Empty state ---
+    if not filtered:
+        _empty_msg = "Aucune analyse trouvée"
+        if _filter_date:
+            _empty_msg = f"Aucune analyse le {_filter_date.strftime('%d %B %Y')}"
+        st.markdown(
+            f'<div style="text-align:center;padding:60px 20px;">'
+            f'<div style="font-size:1.1rem;font-weight:700;color:{t["text_primary"]};margin-bottom:8px;">{_empty_msg}</div>'
+            f'<div style="font-size:0.82rem;color:{t["text_secondary"]};">Sélectionnez une autre date ou lancez une nouvelle analyse.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if _filter_date:
+            if st.button("Voir tout l'historique", key="hist_show_all", use_container_width=True):
+                st.session_state["history_filter_date"] = None
+                st.rerun()
+        return
+
+    # --- Group by period ---
+    _today = _now().date()
+    _week_ago = _today - timedelta(days=7)
+    groups = {"Aujourd'hui": [], "Cette semaine": [], "Plus ancien": []}
+    for h in filtered:
+        _d = h.get("created_at")
+        if not _d:
+            groups["Plus ancien"].append(h)
+            continue
+        if _d.date() == _today:
+            groups["Aujourd'hui"].append(h)
+        elif _d.date() >= _week_ago:
+            groups["Cette semaine"].append(h)
+        else:
+            groups["Plus ancien"].append(h)
+
+    # --- Render grouped list ---
+    for group_name, items in groups.items():
+        if not items:
+            continue
+        st.markdown(
+            f'<div style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;color:{t["text_secondary"]};'
+            f'text-transform:uppercase;padding:16px 0 8px;">{group_name}</div>',
+            unsafe_allow_html=True,
+        )
+        for h in items:
+            _render_history_row(h, t, accent)
+
+
+def _render_history_row(h: dict, t: dict, accent: str):
+    """Render a single history entry row — card with inline Ouvrir button."""
+    source = h.get("source_table", "")
+    source_type = h.get("source_type", "snowflake")
+    rows = h.get("total_rows", 0)
+    score = h.get("score", 0)
+    created = h.get("created_at")
+    hid = h.get("id", "")
+    filename = h.get("filename", "")
+
+    # File type label
+    if source_type == "file" or filename:
+        ext = filename.rsplit(".", 1)[-1].lower() if filename and "." in filename else "csv"
+        _type_label = ext.upper() if ext in ("csv", "xlsx", "xls", "tsv") else "CSV"
+    else:
+        _type_label = "CSV"
+
+    # Source icon
+    if source_type == "snowflake" and not filename:
+        _icon_bg = "rgba(37,99,235,0.08)"
+        _icon_svg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="1.8"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>'
+        _badge_text = "SNOWFLAKE"
+        _badge_bg = "rgba(37,99,235,0.08)"
+        _badge_color = "#2563eb"
+    elif _type_label == "XLSX" or _type_label == "XLS":
+        _icon_bg = "rgba(22,163,74,0.08)"
+        _icon_svg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/></svg>'
+        _badge_text = "SNOWFLAKE"
+        _badge_bg = "rgba(37,99,235,0.08)"
+        _badge_color = "#2563eb"
+    else:
+        _icon_bg = "rgba(37,99,235,0.08)"
+        _icon_svg = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="1.8"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>'
+        _badge_text = "SNOWFLAKE"
+        _badge_bg = "rgba(37,99,235,0.08)"
+        _badge_color = "#2563eb"
+
+    # Date formatting
+    _date_display = ""
+    if created:
+        _date_display = f'{created.strftime("%d %b").lstrip("0")} · {created.strftime("%H:%M")}'
+
+    # Score color
+    _score_color = "#059669" if score >= 75 else ("#d97706" if score >= 50 else "#dc2626")
+    _score_bg = "rgba(5,150,105,0.08)" if score >= 75 else ("rgba(217,119,6,0.08)" if score >= 50 else "rgba(220,38,38,0.08)")
+
+    # Rows formatted
+    _rows_fmt = f"{rows:,}".replace(",", " ") if rows else "0"
+
+    # Render card with Streamlit columns for the button
+    row_html = (
+        f'<div style="display:flex;align-items:center;gap:16px;padding:18px 22px;'
+        f'background:{t["card_bg"]};border:1px solid {t["border"]};border-radius:14px;margin-bottom:8px;">'
+        # Icon
+        f'<div style="width:42px;height:42px;border-radius:12px;background:{_icon_bg};'
+        f'display:flex;align-items:center;justify-content:center;flex-shrink:0;">{_icon_svg}</div>'
+        # Left info: type + badge + rows
+        f'<div style="flex:1;min-width:0;">'
+        f'<div style="display:flex;align-items:center;gap:10px;">'
+        f'<span style="font-size:0.92rem;font-weight:700;color:{t["text_primary"]};">{_type_label}</span>'
+        f'<span style="font-size:0.58rem;font-weight:700;padding:3px 8px;border-radius:5px;'
+        f'background:{_badge_bg};color:{_badge_color};letter-spacing:0.04em;">{_badge_text}</span>'
+        f'</div>'
+        f'<div style="font-size:0.78rem;color:{t["text_secondary"]};margin-top:3px;">{_rows_fmt} lignes</div>'
+        f'</div>'
+        # Right: date + score
+        f'<div style="display:flex;align-items:center;gap:16px;flex-shrink:0;">'
+        f'<span style="font-size:0.78rem;color:{t["text_secondary"]};">{_date_display}</span>'
+        f'<span style="font-size:0.82rem;font-weight:700;color:{_score_color};background:{_score_bg};'
+        f'padding:5px 14px;border-radius:8px;">{score}%</span>'
+        f'</div>'
+        f'</div>'
+    )
+
+    # Use columns: card HTML on left, button on right overlaid
+    _card_col, _btn_col = st.columns([5, 1])
+    with _card_col:
+        st.markdown(row_html, unsafe_allow_html=True)
+    with _btn_col:
+        st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+        if st.button("Ouvrir  →", key=f"hist_open_{hid}", use_container_width=True):
+            st.session_state["viewing_archived_id"] = hid
+            st.session_state["page"] = "dashboard"
+            st.rerun()
+
+
+def page_france():
+    page_header(
+        "France · Conformité & E-Facturation",
+        "Module dédié SIREN, SIRET, TVA intracom et préparation facturation électronique PDP.",
+        badges=["R01–R08", "INSEE 29M+", "E-invoicing"],
+    )
+
+    # If redirected to resolution, set the active tab
+    _fr_tab_names = [
+        "Source & Analyse",
+        "Règles métier",
+        "Data Cleaning",
+        "Tableau de bord",
+        "Centre de résolution",
+        "Audit & Export",
+    ]
+    _default_tab = 0
+    if st.session_state.pop("_goto_fr_resolution", False):
+        _default_tab = 4  # Centre de résolution
+
+    if "_fr_active_tab" not in st.session_state:
+        st.session_state["_fr_active_tab"] = _default_tab
+    elif _default_tab == 4:
+        st.session_state["_fr_active_tab"] = 4
+
+    _selected_tab = st.radio(
+        "Section", _fr_tab_names,
+        index=st.session_state["_fr_active_tab"],
+        horizontal=True, label_visibility="collapsed",
+        key="_fr_tab_radio",
+    )
+    st.session_state["_fr_active_tab"] = _fr_tab_names.index(_selected_tab)
+
+    if _selected_tab == "Source & Analyse":
+        _fr_tab_source_analyse()
+    elif _selected_tab == "Règles métier":
+        _fr_tab_custom_rules()
+        _fr_tab_custom_rules_add_section()
+    elif _selected_tab == "Data Cleaning":
+        _fr_tab_data_cleaning()
+    elif _selected_tab == "Tableau de bord":
+        _fr_tab_dashboard()
+    elif _selected_tab == "Centre de résolution":
+        _fr_tab_resolution()
+    elif _selected_tab == "Audit & Export":
+        _fr_tab_audit_export()
+
+
+def page_rule_catalog():
+    t = get_theme()
+    accent = t['accent']
+
+    # --- Return banner if coming from wizard ---
+    _from_wizard = st.session_state.get("import_wizard_step") == 3
+    if _from_wizard:
+        st.markdown(
+            f'<div style="background:{t["accent_soft"]};border:1px solid {accent};border-radius:12px;padding:12px 20px;margin-bottom:16px;'
+            f'display:flex;align-items:center;justify-content:space-between;">'
+            f'<span style="font-size:0.82rem;color:{accent};font-weight:600;">Créez votre règle ci-dessous, puis revenez lancer l\'analyse.</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("< Retour à l'analyse", key="rules_back_wizard", type="primary"):
+            st.session_state["page"] = "customer_data"
+            st.rerun()
+
+    # --- Header ---
+    st.markdown(
+        f'<div style="margin-bottom:28px;">'
+        f'<h1 style="font-size:1.7rem;font-weight:800;color:{t["text_primary"]};margin:0 0 6px;">Catalogue de règles</h1>'
+        f'<p style="font-size:0.85rem;color:{t["text_secondary"]};margin:0;">Gérez vos contrôles qualité — règles standard, personnalisées et import IA.</p>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    _fr_tab_custom_rules()
+    _fr_tab_custom_rules_add_section()
+
+
+# ---------------------------------------------------------------------------
+# Floating Chatbox: Ask AI (Cortex Analyst)
+# ---------------------------------------------------------------------------
+
+SEMANTIC_VIEW_FQN = "QUALITY_TEST.DATA_QUALITY.SV_QUALITIX"
+
+
+def _call_cortex_analyst(messages: list[dict]) -> dict:
+    """Call Cortex Analyst REST API via the Snowflake connector's session."""
+    conn = _get_conn()
+    if conn is None:
+        return {"error": "Not connected to Snowflake"}
+    token = conn.rest.token
+    # Build the correct host: account with underscores → hyphens for DNS
+    account = conn.account or st.secrets.get("connections", {}).get("snowflake", {}).get("account", "")
+    host = account.replace("_", "-") + ".snowflakecomputing.com"
+    port = 443
+    scheme = "https"
+    url = f"{scheme}://{host}:{port}/api/v2/cortex/analyst/message"
+    headers = {
+        "Authorization": f'Snowflake Token="{token}"',
+        "Content-Type": "application/json",
+    }
+    body = {
+        "messages": messages,
+        "semantic_view": SEMANTIC_VIEW_FQN,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.HTTPError:
+        return {"error": f"HTTP {resp.status_code}: {resp.text[:500]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _render_chat_panel():
+    """Render the right-side AI chat panel (modern floating style)."""
+    t = get_theme()
+
+    if "analyst_history" not in st.session_state:
+        st.session_state["analyst_history"] = []
+
+    # Panel wrapper with clean styling
+    st.markdown(
+        f"""<div style="background:{t['card_bg']};border:1px solid {t['border']};border-radius:14px;
+        padding:16px 18px;margin-bottom:8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <div style="width:28px;height:28px;border-radius:8px;background:{t['accent']};
+                    display:flex;align-items:center;justify-content:center;color:#fff;font-size:0.7rem;font-weight:700;">AI</div>
+                <div>
+                    <div style="font-weight:700;color:{t['text_primary']};font-size:0.85rem;">Cortex Analyst</div>
+                    <div style="font-size:0.65rem;color:{t['text_secondary']};">Text-to-SQL</div>
+                </div>
+            </div>
+            <div style="font-size:0.6rem;padding:3px 8px;background:{t['border_subtle']};border-radius:4px;color:{t['text_secondary']};">BETA</div>
+        </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Close button — subtle
+    if st.button("✕ Fermer", key="close_chat_panel"):
+        st.session_state["chatbox_open"] = False
+        st.rerun()
+
+    # Suggestions (only if no history)
+    if not st.session_state["analyst_history"]:
+        suggestions = ["Combien d'anomalies au total ?", "Quelles entreprises sont les plus impactées ?", "Anomalies critiques ouvertes ?"]
+        for i, s in enumerate(suggestions):
+            if st.button(s, key=f"chatbox_sug_{i}", use_container_width=True):
+                st.session_state["chatbox_pending"] = s
+                st.rerun()
+
+    # Chat history
+    chat_container = st.container(height=350)
+    with chat_container:
+        for entry in st.session_state["analyst_history"]:
+            # User message
+            st.markdown(
+                f'<div style="background:{t["border_subtle"]};border-radius:10px;padding:10px 14px;margin:8px 0;'
+                f'font-size:0.82rem;color:{t["text_primary"]};">{html.escape(entry["question"])}</div>',
+                unsafe_allow_html=True,
+            )
+            # Assistant response
+            if entry.get("text"):
+                st.markdown(
+                    f'<div style="border-left:3px solid {t["accent"]};padding:8px 14px;margin:8px 0;'
+                    f'font-size:0.82rem;color:{t["text_primary"]};background:{t["accent_soft"]};border-radius:0 8px 8px 0;">'
+                    f'{html.escape(entry["text"])}</div>',
+                    unsafe_allow_html=True,
+                )
+            if entry.get("sql"):
+                with st.expander("SQL", expanded=False):
+                    st.code(entry["sql"], language="sql")
+            if entry.get("dataframe") is not None and not entry["dataframe"].empty:
+                st.dataframe(entry["dataframe"], use_container_width=True, height=120)
+            if entry.get("error"):
+                st.error(entry["error"])
+
+    # Clear history
+    if st.session_state["analyst_history"]:
+        if st.button("Effacer", key="clear_chat"):
+            st.session_state["analyst_history"] = []
+            st.rerun()
+
+    # Input
+    pending = st.session_state.pop("chatbox_pending", None)
+    user_input = st.text_input(
+        "Question",
+        value=pending or "",
+        key="chatbox_text_input",
+        placeholder="Posez votre question...",
+        label_visibility="collapsed",
+    )
+    send_clicked = st.button("Envoyer", key="chatbox_send", use_container_width=True, type="primary")
+    question = user_input.strip() if send_clicked and user_input.strip() else None
+    if pending and not question:
+        question = pending
+
+    if question:
+        api_messages = []
+        for h in st.session_state["analyst_history"]:
+            api_messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": h["question"]}],
+            })
+            analyst_content = []
+            if h.get("text"):
+                analyst_content.append({"type": "text", "text": h["text"]})
+            if h.get("sql"):
+                analyst_content.append({"type": "sql", "statement": h["sql"]})
+            if analyst_content:
+                api_messages.append({"role": "analyst", "content": analyst_content})
+        api_messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": question}],
+        })
+
+        with st.spinner("Cortex Analyst..."):
+            result = _call_cortex_analyst(api_messages)
+
+        entry = {"question": question, "text": None, "sql": None, "dataframe": None, "error": None}
+
+        if "error" in result:
+            entry["error"] = result["error"]
+        else:
+            message = result.get("message", {})
+            for content_block in message.get("content", []):
+                ctype = content_block.get("type")
+                if ctype == "text":
+                    entry["text"] = content_block.get("text", "")
+                elif ctype == "sql":
+                    sql = content_block.get("statement", "")
+                    entry["sql"] = sql
+                    df = _sf_query(sql)
+                    if not df.empty:
+                        entry["dataframe"] = df
+                elif ctype == "suggestions":
+                    sugs = content_block.get("suggestions", [])
+                    if sugs:
+                        entry["text"] = "Suggestions : " + " | ".join(sugs)
+
+        st.session_state["analyst_history"].append(entry)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def page_login():
+    theme_key = st.session_state.get("theme", "light")
+    is_dark = theme_key == "dark"
+
+    # --- Design tokens matching the HTML mockup ---
+    brand = "#0E9C8A"
+    brand_light = "#1BD1B4"
+    if is_dark:
+        bg = "#0A1622"
+        panel_bg = "radial-gradient(120% 100% at 0% 0%,#123a4d 0%,#060F19 55%)"
+        surface = "#101E2E"
+        ink = "#EAF1F7"
+        ink2 = "#CBD8E3"
+        slate = "#8FA3B3"
+        line = "#20303F"
+        input_bg = "#0B1826"
+    else:
+        bg = "#F4F7FA"
+        panel_bg = "radial-gradient(120% 100% at 0% 0%,#123a4d 0%,#0C1B2A 55%)"
+        surface = "#FFFFFF"
+        ink = "#0C1B2A"
+        ink2 = "#1B3047"
+        slate = "#5A6B7B"
+        line = "#E7ECF1"
+        input_bg = "#F7F9FC"
+
+    # --- Full-page CSS override ---
+    st.markdown(f"""<style>
+    @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+    [data-testid="stAppViewContainer"] {{ background: {bg} !important; }}
+    [data-testid="stHeader"] {{ background: transparent !important; }}
+    [data-testid="stSidebar"] {{ display: none !important; }}
+    [data-testid="stMainBlockContainer"] {{ padding-top: 0 !important; max-width: 100% !important; padding-left:0 !important; padding-right:0 !important; }}
+    [data-testid="stForm"] {{ border: none !important; padding: 0 !important; }}
+    .login-card input, .login-card [data-baseweb="input"] input {{
+        background: {input_bg} !important; color: {ink} !important;
+        border: 1px solid {line} !important; border-radius: 11px !important;
+        padding: 12px 14px !important; font-size: 13.5px !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        -webkit-text-fill-color: {ink} !important;
+    }}
+    .login-card input::placeholder {{ color: {slate} !important; opacity: 0.7; }}
+    .login-card input:focus {{ border-color: {brand} !important; box-shadow: 0 0 0 3px rgba(14,156,138,0.14) !important; }}
+    .login-card [data-testid="stWidgetLabel"] p,
+    .login-card [data-testid="stWidgetLabel"] span,
+    .login-card label {{ color: {ink2} !important; font-size: 12px !important; font-weight: 600 !important; }}
+    .login-card [data-testid="stFormSubmitButton"] button {{
+        width: 100% !important;
+        background: linear-gradient(135deg, {brand}, #12b6a0) !important;
+        color: #fff !important; font-weight: 600 !important; font-size: 14.5px !important;
+        border: none !important; border-radius: 12px !important; padding: 14px !important;
+        box-shadow: 0 10px 22px -8px rgba(14,156,138,0.65) !important;
+        font-family: 'Inter', sans-serif !important;
+    }}
+    .login-card [data-testid="stFormSubmitButton"] button:hover {{
+        transform: translateY(-1px); box-shadow: 0 14px 28px -8px rgba(14,156,138,0.75) !important;
+    }}
+    .login-card [data-testid="stRadio"] > div {{ flex-direction: row !important; gap: 20px !important; }}
+    .login-card [data-testid="stRadio"] label {{ color: {ink2} !important; font-weight: 500 !important; }}
+    .topbar-login [data-testid="stSelectbox"] {{ min-width: 90px; }}
+    .topbar-login [data-testid="stWidgetLabel"] p {{ font-size: 10px !important; letter-spacing: 0.1em !important;
+        text-transform: uppercase !important; color: {slate} !important; font-weight: 600 !important; }}
+    </style>""", unsafe_allow_html=True)
+
+    # --- Top bar: Language + Appearance ---
+    st.markdown('<div class="topbar-login">', unsafe_allow_html=True)
+    _, _, col_lang, col_theme = st.columns([4, 1, 0.8, 0.8])
+    with col_lang:
+        lang_opts = ["FR", "EN"]
+        lang_default = 0
+        lang_sel = st.selectbox("Langue", lang_opts, index=lang_default, key="login_lang_sel")
+        new_lang = "fr" if lang_sel == "FR" else "en"
+        if new_lang != st.session_state.get("lang", "fr"):
+            st.session_state["lang"] = new_lang
+            st.rerun()
+    with col_theme:
+        theme_opts = ["Clair", "Sombre"]
+        theme_default = 1 if is_dark else 0
+        theme_sel = st.selectbox("Apparence", theme_opts, index=theme_default, key="login_theme_sel")
+        new_theme = "dark" if theme_sel in ("Sombre", "Dark") else "light"
+        if new_theme != st.session_state.get("theme", "light"):
+            st.session_state["theme"] = new_theme
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- Main 2-column layout ---
+    col_hero, col_form = st.columns([1.1, 0.9], gap="large")
+
+    # --- LEFT: Brand panel (pure HTML) ---
+    with col_hero:
+        _eyebrow = "Gouvernance des donn\u00e9es B2B"
+        _h1a = "La qualit\u00e9 de vos donn\u00e9es,"
+        _h1b = "sous contr\u00f4le."
+        _lead = ("Plateforme enterprise connect\u00e9e \u00e0 Snowflake \u2014 d\u00e9tection d\u2019anomalies, "
+                 "conformit\u00e9 r\u00e9glementaire fran\u00e7aise et correction assist\u00e9e par IA.")
+        _steps = [("01", "Ing\u00e9rer"),
+                  ("02", "Contr\u00f4ler"),
+                  ("03", "Corriger"),
+                  ("04", "Auditer")]
+        _foot = "Connexion chiffr\u00e9e TLS \u00b7 Aucune donn\u00e9e stock\u00e9e localement"
+
+        steps_html = "".join(f'<div style="flex:1;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:13px 14px;"><div style="font-family:monospace;font-size:11px;color:{brand_light};font-weight:600;">{sn}</div><div style="font-size:14px;font-weight:600;margin-top:4px;color:#fff;">{st_}</div></div>' for sn, st_ in _steps)
+
+        hero_html = f'''
+        <div style="position:relative;overflow:hidden;background:{panel_bg};
+            border-radius:20px;padding:42px 46px;min-height:580px;color:#fff;font-family:Inter,sans-serif;">
+            <div style="position:absolute;width:340px;height:340px;background:{brand};border-radius:50%;
+                filter:blur(70px);top:-90px;right:-60px;opacity:0.35;"></div>
+            <div style="position:absolute;width:280px;height:280px;background:{brand_light};border-radius:50%;
+                filter:blur(70px);bottom:-100px;left:-40px;opacity:0.22;"></div>
+            <div style="position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,0.04) 1px,transparent 1px),
+                linear-gradient(90deg,rgba(255,255,255,0.04) 1px,transparent 1px);background-size:44px 44px;"></div>
+            <div style="position:relative;z-index:2;">
+                <div style="display:flex;align-items:center;gap:13px;margin-bottom:34px;">
+                    <div style="width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,{brand},{brand_light});
+                        display:grid;place-items:center;color:#04241f;font-weight:800;font-size:23px;
+                        box-shadow:0 8px 20px -6px rgba(14,156,138,0.7);">L</div>
+                    <div>
+                        <div style="font-weight:700;font-size:21px;">L\u00e9on</div>
+                        <div style="font-size:10px;letter-spacing:0.24em;color:{brand_light};text-transform:uppercase;margin-top:2px;font-weight:600;">Data Quality</div>
+                    </div>
+                </div>
+                <div style="font-size:11px;letter-spacing:0.18em;text-transform:uppercase;color:{brand_light};font-weight:700;">{_eyebrow}</div>
+                <div style="width:44px;height:3px;border-radius:3px;background:{brand};margin-top:10px;margin-bottom:26px;"></div>
+                <div style="font-size:34px;font-weight:700;line-height:1.18;letter-spacing:-0.02em;">
+                    {_h1a}<br><span style="color:{brand_light};font-style:italic;">{_h1b}</span></div>
+                <p style="color:rgba(174,192,206,0.85);font-size:14.5px;margin-top:16px;line-height:1.6;max-width:440px;">{_lead}</p>
+                <div style="display:flex;gap:12px;margin-top:30px;">{steps_html}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;">
+                    <span style="font-size:11px;font-weight:600;color:{brand_light};background:rgba(27,209,180,0.12);border:1px solid rgba(27,209,180,0.2);padding:5px 12px;border-radius:20px;">Snowflake Native</span>
+                    <span style="font-size:11px;font-weight:600;color:{brand_light};background:rgba(27,209,180,0.12);border:1px solid rgba(27,209,180,0.2);padding:5px 12px;border-radius:20px;">INSEE Sirene 29M+</span>
+                    <span style="font-size:11px;font-weight:600;color:{brand_light};background:rgba(27,209,180,0.12);border:1px solid rgba(27,209,180,0.2);padding:5px 12px;border-radius:20px;">E-facturation R01\u2013R08</span>
+                    <span style="font-size:11px;font-weight:600;color:{brand_light};background:rgba(27,209,180,0.12);border:1px solid rgba(27,209,180,0.2);padding:5px 12px;border-radius:20px;">Cortex Analyst</span>
+                </div>
+                <div style="margin-top:36px;display:flex;align-items:center;gap:10px;font-size:12px;color:rgba(174,192,206,0.7);">
+                    <span style="width:7px;height:7px;border-radius:50%;background:#16A34A;box-shadow:0 0 0 3px rgba(22,163,74,0.25);"></span>
+                    {_foot}</div>
+            </div>
+        </div>'''
+        st.markdown(hero_html, unsafe_allow_html=True)
+
+    # --- RIGHT: Login form ---
+    with col_form:
+        _badge_bg = "rgba(14,156,138,0.16)" if is_dark else "#E4F5F2"
+        _badge_text = "Environnement d\u00e9mo"
+        _title_text = "Connexion Snowflake"
+        _sub_user = st.session_state.get("sf_user", "SNOWADMIN")
+        _sub_acct = st.session_state.get("sf_account", "SFSEEUROPE-TEST_DEMO_ACCOUNT_AS")
+        st.markdown(f'''
+        <div style="display:inline-flex;align-items:center;gap:7px;font-size:10.5px;font-weight:700;
+            letter-spacing:0.08em;text-transform:uppercase;color:#0B7D6F;
+            background:{_badge_bg};
+            padding:5px 11px;border-radius:20px;margin-bottom:12px;">
+            <span style="width:6px;height:6px;border-radius:50%;background:#16A34A;"></span>
+            {_badge_text}
+        </div>
+        <div style="font-size:22px;font-weight:700;color:{ink};margin-bottom:4px;">
+            {_title_text}
+        </div>
+        <div style="font-family:monospace;font-size:11.5px;color:{slate};margin-bottom:18px;">
+            {_sub_user} &middot; {_sub_acct}
+        </div>
+        ''', unsafe_allow_html=True)
+
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+
+        auth_label = "Authentification"
+        auth_options = ["Mot de passe", "SSO (navigateur)"]
+        auth_choice = st.radio(auth_label, auth_options, index=0, horizontal=True, key="login_auth_method")
+        use_sso = auth_choice == auth_options[1]
+
+        with st.form("sf_login_form"):
+            account = st.text_input(
+                "Compte",
+                value=st.session_state.get("sf_account", "SFSEEUROPE-TEST_DEMO_ACCOUNT_AS"),
+            )
+            user = st.text_input(
+                "Utilisateur",
+                value=st.session_state.get("sf_user", "SNOWADMIN"),
+            )
+            if not use_sso:
+                password = st.text_input(
+                    "Mot de passe",
+                    type="password", value="",
+                )
+            else:
+                password = ""
+            c1, c2 = st.columns(2)
+            with c1:
+                passcode = st.text_input("MFA", placeholder="Optionnel")
+            with c2:
+                warehouse = st.text_input(
+                    "Warehouse",
+                    value=st.session_state.get("sf_warehouse", "COMPUTE_WH"),
+                )
+            submitted = st.form_submit_button(
+                "Se connecter \u00e0 L\u00e9on  \u203a",
+                type="primary", use_container_width=True,
+            )
+
+        _footer_text = "Connexion s\u00e9curis\u00e9e \u00b7 aucune donn\u00e9e stock\u00e9e"
+        st.markdown(f'''
+        <div style="text-align:center;font-size:11px;color:{slate};margin-top:14px;display:flex;
+            align-items:center;justify-content:center;gap:7px;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="{brand}" stroke-width="2">
+                <rect x="4.5" y="10" width="15" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            {_footer_text}
+        </div>
+        ''', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- Handle form submission ---
+    if submitted:
+        if not account.strip() or not user.strip():
+            st.error("Veuillez remplir tous les champs obligatoires.")
+        elif not password and not use_sso:
+            st.error("Veuillez entrer votre mot de passe.")
+        else:
+            with st.spinner("Connexion en cours..."):
+                try:
+                    _build_conn.clear()
+                    authenticator = "externalbrowser" if use_sso else ""
+                    conn = _build_conn(
+                        account.strip(), user.strip(), password,
+                        warehouse.strip() or "COMPUTE_WH", passcode.strip(), authenticator,
+                    )
+                    conn.cursor().execute("SELECT 1")
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA()")
+                        row = cur.fetchone()
+                        if row:
+                            if row[0]:
+                                st.session_state["sf_database"] = row[0]
+                            if row[1]:
+                                st.session_state["sf_schema"] = row[1]
+                    except Exception:
+                        pass
+                    st.session_state["sf_account"] = account.strip()
+                    st.session_state["sf_user"] = user.strip()
+                    st.session_state["sf_password"] = password
+                    st.session_state["sf_passcode"] = passcode.strip()
+                    st.session_state["sf_warehouse"] = warehouse.strip() or "COMPUTE_WH"
+                    st.session_state["sf_authenticator"] = authenticator
+                    st.session_state["authenticated"] = True
+                    load_dq_findings.clear()
+                    load_dim_account.clear()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Échec de connexion : {exc}")
+
+PAGE_RENDERERS = {
+    "dashboard": page_dashboard,
+    "customer_data": page_customer_data,
+    "run_analysis": page_run_analysis,
+    "findings": page_findings,
+    "tasks": page_tasks,
+    "exports": page_exports,
+    "history": page_history,
+    # "france": page_france,
+    "rule_catalog": page_rule_catalog,
+}
+
+
+def main():
+    st.set_page_config(
+        page_title="Léon — Qualité des données",
+        page_icon="L",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    if "theme" not in st.session_state:
+        st.session_state["theme"] = "light"
+    if "page" not in st.session_state:
+        st.session_state["page"] = "dashboard"
+
+    inject_css()
+
+    if not st.session_state.get("authenticated"):
+        page_login()
+        return
+
+    init_session_data()
+    render_sidebar()
+
+    # Layout: if chatbox open -> page | chat panel side-by-side
+    if "chatbox_open" not in st.session_state:
+        st.session_state["chatbox_open"] = False
+
+    if st.session_state["chatbox_open"]:
+        col_page, col_chat = st.columns([3, 1.2])
+        with col_page:
+            renderer = PAGE_RENDERERS.get(st.session_state["page"], page_dashboard)
+            renderer()
+        with col_chat:
+            _render_chat_panel()
+    else:
+        renderer = PAGE_RENDERERS.get(st.session_state["page"], page_dashboard)
+        renderer()
+
+
+if __name__ == "__main__":
+    main()
