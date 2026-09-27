@@ -1,0 +1,53 @@
+####################################################################
+# RÈGLES QUALITÉ - Référentiel clients B2B
+# Rédigé par l'équipe Data Gouvernance - format libre, à normaliser
+# NB : certaines règles sont mal écrites exprès, à vous de les interpréter
+####################################################################
+
+## --- Bloc 1 : identifiants légaux ---
+
+R-SIREN : le SIREN doit faire exactement 9 chiffres, pas de lettres, pas d'espaces. CRITIQUE.
+
+Règle SIRET => 14 caractères numériques. Les 9 premiers = le SIREN de l'entreprise.
+    (si le SIRET est là mais pas le SIREN, on peut déduire le SIREN)
+
+- La TVA intracommunautaire française commence par "FR" suivi de 11 chiffres.
+  Exemple valide : FR32552081317. Gravité : haute.
+
+le numero de tva ne doit jamais etre vide pour une societe française  // important +++
+
+## --- Bloc 2 : coordonnées ---
+
+email : format standard obligatoire (quelque chose@domaine.extension). sinon medium.
+Le mail perso genre gmail/hotmail est toléré mais on préfère un mail pro.  <-- pas bloquant
+
+Code postal francais : 5 chiffres. Attention la Corse c'est 2A / 2B au début (ex 20000).
+Téléphone : soit 10 chiffres commençant par 0, soit format international +33.
+
+adresse complete = non vide, doit contenir au moins un numéro et un nom de rue
+
+## --- Bloc 3 : cohérence & référentiel ---
+
+>> Vérifier que le nom de l'entreprise correspond bien à celui de l'INSEE (tolérance orthographe).
+>> Le code NAF doit exister dans la nomenclature officielle (format 4 chiffres + 1 lettre, ex 6201Z)
+>> forme juridique : uniquement dans la liste [SAS, SARL, SA, EURL, SASU, SCI, SNC]. Le reste = à vérifier.
+
+Une entreprise déclarée "active" ne doit pas être radiée à l'INSEE (sinon anomalie grave).
+
+## --- Bloc 4 : règles floues / pièges (pour tester) ---
+
+- "les données doivent être propres"          <-- trop vague, non traduisible
+- le pays c'est la France normalement
+- si y'a un doublon faut le virer
+- Ne pas accepter les clients bidons / fantômes
+- La raison sociale ne devrait pas contenir de caractères bizarres genre @@@ ou ??? ou des emojis
+- vérifier que le chiffre d'affaires est positif (colonne "ca" si elle existe)
+
+## --- Bloc 5 : format tableur collé depuis Excel ---
+
+champ;controle;seuil
+iban;doit être un IBAN valide (commence par FR76 pour la France);high
+date_creation;ne peut pas être dans le futur;medium
+effectif;nombre entier >= 0;low
+
+FIN DU FICHIER — merci de bien tout reprendre car c'est un mélange de plein de sources
