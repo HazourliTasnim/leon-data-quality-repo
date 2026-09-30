@@ -68,41 +68,50 @@ app.py
 │                 - Themes (dark/light), pages, aliases colonnes
 │                 - Templates de regles, sujets d'analyse
 │
-├── [L246-590]   DATA LAYER (SQL/Snowflake)
-│                 - Connexion, requetes, cache
-│                 - Toutes les fonctions qui parlent a Snowflake
+├── [L246-627]   DATA LAYER (SQL/Snowflake)
+│                 - Connexion, requetes, cache (_get_conn, _sf_query, _sf_execute)
+│                 - Lectures DQ_*, lookup SIRENE, historique des analyses
 │
-├── [L592-790]   HELPERS (CRUD regles, tables, Cortex)
+├── [L628-854]   HELPERS (CRUD regles, tables, Cortex)
 │                 - Gestion des regles custom
-│                 - Appels Cortex AI
+│                 - Suggestions Cortex AI (cle de jointure, regles)
 │
-├── [L816-1030]  CORRECTIONS & VERIFICATION
+├── [L855-1076]  CORRECTIONS & VERIFICATION
 │                 - Appliquer une correction depuis INSEE
-│                 - Verification web (Cortex AI)
+│                 - Verification web (Pappers, Google, Cortex AI)
 │
-├── [L1032-1480] PIPELINE DEDUPLICATION
+├── [L1077-1619] PIPELINE DEDUPLICATION
 │                 - 3 phases : exact, format, similarite
+│                 - Dedup SQL + staging (DQ_STAGING_IMPORT, write_pandas)
 │
-├── [L1482-2985] UI HELPERS & STYLING
-│                 - CSS global, composants reutilisables
+├── [L1620-1715] MOTEUR DE REGLES (tables Snowflake)
+│                 - run_snowflake_dq_analysis()
 │
-├── [L2987-3370] IMPORT & DETECTION COLONNES
+├── [L1716-3084] UI HELPERS & STYLING
+│                 - CSS global, composants reutilisables, badges, KPI
+│
+├── [L3085-3505] IMPORT & DETECTION COLONNES + SIRENE
 │                 - detect_column_mapping() : alias matching
 │                 - detect_column_mapping_ai() : Cortex AI
+│                 - Validateurs SIREN/SIRET/TVA/NAF
+│                 - _cortex_search_sirene() : recherche vectorielle (L3348)
 │
-├── [L3373-3983] MOTEUR D'ANALYSE PRINCIPAL
+├── [L3506-4139] MOTEUR D'ANALYSE PRINCIPAL
 │                 - analyze_uploaded_dataframe() — LE COEUR
 │
-├── [L3985-4210] UTILITAIRES SESSION
-│                 - Gestion session_state, scoring
+├── [L4140-4305] UTILITAIRES SESSION
+│                 - Gestion session_state, SLA, stockage des resultats
 │
-├── [L4825-9900] PAGES (UI)
-│                 - Dashboard, Import, Analyse, Anomalies, Historique
+├── [L4306-10778] PAGES (UI)
+│                 - Sidebar, Dashboard, Donnees clients, Analyse, Anomalies,
+│                   Taches, Exports, Enrichissement SIRENE, Historique, Catalogue
 │
-├── [L9903-10070] CHATBOX (Cortex AI assistant)
+├── [L10779-10947] CHATBOX (Cortex Analyst, vue semantique SV_QUALITIX)
 │
-└── [L10076-10390] LOGIN & MAIN
+└── [L10948-11254] LOGIN & MAIN
 ```
+
+> Numeros de ligne verifies le 2026-09-30 (app.py = 11 254 lignes). Ils derivent a chaque modification : se fier aux noms de fonctions.
 
 ---
 
@@ -167,7 +176,7 @@ app.py
 
 ## 6. Le moteur d'analyse — En detail
 
-**Fonction :** `analyze_uploaded_dataframe()` (~600 lignes, L3373)
+**Fonction :** `analyze_uploaded_dataframe()` (~630 lignes, L3506)
 
 C'est la fonction la plus importante du projet. Voici ce qu'elle fait :
 

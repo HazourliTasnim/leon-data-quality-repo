@@ -33,7 +33,7 @@ requirements.txt        # Dependances Python
 snowflake.yml           # Configuration Snowflake CLI
 .streamlit/
   config.toml           # Configuration Streamlit (theme, port)
-  secrets.toml          # Identifiants Snowflake (non committe)
+  secrets.toml          # Optionnel, non committe (voir "Connexion Snowflake")
 input/                  # Fichiers de donnees pour import
 snowflake_setup/        # Scripts SQL de creation des objets Snowflake (tables, Cortex Search)
 ```
@@ -68,7 +68,8 @@ snowflake_setup/        # Scripts SQL de creation des objets Snowflake (tables, 
 
 ## Connexion Snowflake
 
-- **Account** : configure dans `.streamlit/secrets.toml`
+- **Identifiants** : saisis sur l'ecran de connexion de l'app (compte, utilisateur, mot de passe + code MFA, ou SSO navigateur). Aucun identifiant n'est lu depuis un fichier.
+- **`.streamlit/secrets.toml`** : optionnel. Seule la cle `[connections.snowflake] account` est lue, en secours, par l'assistant Cortex Analyst si la connexion ne fournit pas le nom du compte.
 - **Database** : `QUALITY_TEST`
 - **Schema** : `COMMERCIAL_DATA` (donnees), `DATA_QUALITY` (DQ engine)
 - **Warehouse** : `COMPUTE_WH`

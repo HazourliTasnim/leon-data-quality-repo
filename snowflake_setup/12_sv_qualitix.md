@@ -69,7 +69,3 @@ DQ_FINDINGS (03_dq_findings.sql)
 ```
 
 Les deux tables physiques doivent exister et contenir des données avant que la vue sémantique soit exploitable par Cortex Analyst.
-
-## Portage GCP
-
-Pas d'équivalent direct de la vue sémantique + Cortex Analyst. Pistes : Conversational Analytics (Looker / BigQuery) avec un modèle LookML ou un contexte de données reprenant les dimensions, métriques et synonymes ci-dessus.
