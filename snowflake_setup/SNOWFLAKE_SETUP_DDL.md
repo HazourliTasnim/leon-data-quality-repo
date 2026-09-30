@@ -22,7 +22,7 @@ Les scripts sont numérotés dans l'ordre de dépendance :
 | 09 | [09_dq_dedup_results.sql](09_dq_dedup_results.sql) | `DQ_DEDUP_RESULTS` | TABLE — résultats de dédoublonnage |
 | 10 | [10_dq_scoring.sql](10_dq_scoring.sql) | `DQ_SCORING` | TABLE — scores qualité par ligne |
 | 11 | [11_dq_staging_import_clean.sql](11_dq_staging_import_clean.sql) | `DQ_STAGING_IMPORT_CLEAN` | TABLE TRANSIENT — staging import |
-| 12 | [12_sv_qualitix.sql](12_sv_qualitix.sql) | `SV_QUALITIX` | SEMANTIC VIEW — Cortex Analyst, 2 tables (ACCOUNTS + FINDINGS), 4 métriques, 7 dimensions |
+| 12 | [12_sv_qualitix.sql](12_sv_qualitix.sql) | `SV_QUALITIX` | SEMANTIC VIEW — Cortex Analyst, 2 tables (ACCOUNTS + FINDINGS), 4 métriques, 9 dimensions — voir [12_sv_qualitix.md](12_sv_qualitix.md) |
 
 ## Prérequis
 
@@ -36,9 +36,10 @@ Les scripts sont numérotés dans l'ordre de dépendance :
 
 - **Tous les scripts utilisent `CREATE OR REPLACE`** : les relancer sur un compte existant supprime les données en place. Pour une première installation uniquement.
 - **`SIRENE_SIEGES` : structure seule, pas de chargement.** Le script 01 crée la table vide. La requête qui la remplit depuis le Marketplace SIRENE (`V_UNITE_LEGALE` + `V_ETABLISSEMENT`, filtrée sur les sièges) n'a pas été extraite et reste à documenter.
-- **`SV_QUALITIX`** (12) est la vue sémantique utilisée par l'assistant de chat Cortex Analyst de l'app (`SEMANTIC_VIEW_FQN` dans `app.py`). Sans elle, le chat ne répond pas ; le reste de l'app fonctionne.
+- **`SV_QUALITIX`** (12) est la vue sémantique utilisée par l'assistant de chat Cortex Analyst de l'app (`SEMANTIC_VIEW_FQN` dans `app.py`). Sans elle, le chat ne répond pas ; le reste de l'app fonctionne. Son script (12) a été **reconstruit à partir de la documentation**, pas extrait de Snowflake : à remplacer par la sortie de `GET_DDL('SEMANTIC_VIEW', ...)` si possible.
 - **`DIM_ACCOUNT`** (00) est la table client lue par défaut quand l'utilisateur analyse une table Snowflake plutôt qu'un fichier importé (nom configurable à la connexion).
-- **Tables non utilisées par `app.py`** : `DQ_SESSION_CACHE` (07) et `DQ_STAGING_IMPORT_CLEAN` (11) existent dans le compte mais aucune requête de l'application actuelle ne les lit ni ne les écrit. Probablement des vestiges d'anciennes versions — à ne pas porter en priorité.
+- **Table non utilisée par `app.py`** : `DQ_SESSION_CACHE` (07) existe dans le compte mais aucune requête de l'application actuelle ne la lit ni ne l'écrit. Probablement un vestige d'une ancienne version — à ne pas porter en priorité.
+- **Tables de staging recréées par l'app** : `DQ_STAGING_IMPORT_CLEAN` (11) est recréée à chaque dédoublonnage (`CREATE OR REPLACE TRANSIENT TABLE ... AS SELECT` dans `deduplicate_snowflake_table()`), et `DQ_STAGING_IMPORT` est créée par `write_pandas` lors de l'import d'un fichier. Le script 11 n'est donc pas indispensable.
 - **`DQ_ANALYSIS_HISTORY`** est aussi créée automatiquement par l'app au premier run (`CREATE TABLE IF NOT EXISTS` dans `_ensure_history_table()`).
 
 ## Correspondance pour un portage GCP / BigQuery

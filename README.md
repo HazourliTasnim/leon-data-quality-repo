@@ -6,6 +6,14 @@ Analyse automatisee des identifiants legaux (SIREN, SIRET, TVA intracommunautair
 
 ---
 
+## Prerequis Snowflake
+
+L'application s'appuie sur des objets Snowflake qui doivent exister avant le premier lancement (tables `DQ_*`, referentiel `SIRENE_SIEGES`, service de recherche vectorielle `SIRENE_COMPANY_SEARCH`, vue semantique `SV_QUALITIX`).
+
+Les scripts de creation, numerotes dans l'ordre d'execution, sont dans [snowflake_setup/](snowflake_setup/). Le mode d'emploi et les points d'attention sont dans [snowflake_setup/SNOWFLAKE_SETUP_DDL.md](snowflake_setup/SNOWFLAKE_SETUP_DDL.md).
+
+---
+
 ## Lancer l'application
 
 ```bash
