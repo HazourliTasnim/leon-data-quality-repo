@@ -27,6 +27,7 @@ snowflake.yml           # Configuration Snowflake CLI
   config.toml           # Configuration Streamlit (theme, port)
   secrets.toml          # Identifiants Snowflake (non committe)
 input/                  # Fichiers de donnees pour import
+snowflake_setup/        # Scripts SQL de creation des objets Snowflake (tables, Cortex Search)
 ```
 
 ---
