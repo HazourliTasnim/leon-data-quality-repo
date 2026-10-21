@@ -25,6 +25,53 @@ Accessible sur http://localhost:8501
 
 ---
 
+## Guide demo (pas a pas)
+
+### 1. Installation (une seule fois)
+
+1. Installer **Python 3.10 a 3.12** depuis python.org (Windows : cocher *Add Python to PATH*).
+2. Recuperer le code :
+   ```bash
+   git clone https://github.com/HazourliTasnim/leon-data-quality-repo.git
+   cd leon-data-quality-repo
+   ```
+3. Creer un environnement et installer les dependances :
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\activate          # Windows (Mac/Linux : source .venv/bin/activate)
+   pip install -r requirements.txt
+   ```
+   > Windows : si `python` n'est pas reconnu, utiliser `py` (ex. `py -m pip install -r requirements.txt`).
+   > Si PowerShell bloque l'activation : `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+Aucun script `snowflake_setup/` a lancer : les objets existent deja sur le compte de demo.
+
+### 2. Avant la demo
+
+1. Mettre a jour le code : `git pull`
+2. Lancer l'app : `streamlit run app.py` (ou `py -m streamlit run app.py`), puis ouvrir http://localhost:8501
+3. Se connecter sur l'ecran de connexion :
+   - **Compte** : `SFSEEUROPE-TEST_DEMO_ACCOUNT_AS`
+   - **Utilisateur** : `LEON_DEMO` (mot de passe communique separement)
+   - **MFA** : le code est envoye sur l'appareil enregistre pour `LEON_DEMO` ; prevoir la personne qui le detient, ou un contournement temporaire par un admin (`ALTER USER LEON_DEMO SET MINS_TO_BYPASS_MFA = 240;`)
+4. Faire un essai complet avec `input/fichier_test_1.xlsx` pour verifier que tout repond (connexion, Cortex, export).
+
+### 3. Deroule de la demo
+
+1. **Tableau de bord** : presenter les KPIs (score de conformite, anomalies, completude).
+2. **Lancer l'analyse** :
+   1. *Selection des sujets* : choisir les controles (conformite, doublons...).
+   2. *Perimetre* : importer le fichier (ex. `input/fichier_test_1.xlsx`), verifier la **correspondance des colonnes** (detection automatique par IA), puis *Valider et continuer*.
+   3. *Data Cleaning* : choisir les colonnes de detection (bouton **Tout selectionner** disponible), puis *Demarrer le nettoyage* (doublons exacts, corrections, similarite).
+   4. *Execution* : application des regles et rapprochement INSEE SIRENE.
+   5. *Resultats* : lignes analysees, anomalies par severite, doublons supprimes, score de conformite.
+3. **Anomalies** : filtrer par severite / statut, montrer la verification web (Agent IA).
+4. **Taches** : accepter / corriger / rejeter en masse.
+5. **Catalogue de regles** : montrer l'import de regles metier en langage naturel (`input/regles_metier_test.txt`).
+6. **Exports** : telecharger le rapport (colonnes originales et corrigees cote a cote).
+
+
+
 ## Architecture
 
 ```
