@@ -1,4 +1,4 @@
-﻿"""Leon — Data Quality Platform."""
+"""Leon — Data Quality Platform."""
 
 import html
 import io
@@ -4924,7 +4924,12 @@ def _render_import_results():
 
 def render_sidebar():
     t = get_theme()
-    findings = get_findings()
+    # Badge counts: only findings of the source currently being analysed (not the whole DQ_FINDINGS history)
+    _cur_src = st.session_state.get("wizard_file_upload") or ""
+    if not _cur_src:
+        _fqn_cur = _dim_account_fqn()
+        _cur_src = _fqn_cur if not _fqn_cur.startswith("..") else ""
+    findings = load_dq_findings(_cur_src) if _cur_src else []
     open_findings = sum(1 for f in findings if f["status"] == "Open")
     open_tasks = sum(1 for f in findings if f["status"] in ("Open", "In Review"))
     _fr_anomalies = get_all_fr_anomalies()
@@ -6151,6 +6156,11 @@ def page_customer_data():
             return
         _fname = st.session_state.get("import_wizard_filename", st.session_state.get("import_wizard_table", "Table"))
         cols = list(df_raw.columns)
+        # Recompute the auto-mapping whenever a different file / column set is loaded
+        _map_sig = (str(_fname), tuple(cols))
+        if st.session_state.get("import_wizard_automap_sig") != _map_sig:
+            st.session_state.pop("import_wizard_automap", None)
+            st.session_state["import_wizard_automap_sig"] = _map_sig
         if "import_wizard_automap" not in st.session_state:
             # Clear stale selectbox keys from previous file uploads
             for _f in IMPORT_FIELD_LABELS:
@@ -6224,6 +6234,11 @@ def page_customer_data():
                 st.rerun()
         with _nav2:
             if st.button("Valider et continuer  \u203A", type="primary", use_container_width=True, key="import_validate"):
+                # New source: drop cleaned data / dedup state left over from a previous analysis
+                for _k in ["wiz_clean_df", "fr_clean_df", "fr_removed_df", "dedup_pipeline_state",
+                           "dedup_compare_cols", "dedup_compare_cols_saved", "wizard_stats",
+                           "fr_upload_anomalies", "fr_upload_stats", "fr_scan_done"]:
+                    st.session_state.pop(_k, None)
                 st.session_state["wizard_uploaded_df"] = df_raw
                 st.session_state["wizard_source"] = _mode
                 st.session_state["wizard_file_upload"] = _fname
@@ -7116,7 +7131,18 @@ def page_run_analysis():
                 default_cols = [c for c in all_cols if any(k in c.lower() for k in ("name", "nom", "siren", "company", "raison")) and "siret" not in c.lower()]
                 if not default_cols:
                     default_cols = all_cols[:3]
-                compare_cols = st.multiselect("Colonnes pour la détection", all_cols, default=default_cols, key="dedup_compare_cols")
+                _sa1, _sa2, _ = st.columns([1, 1, 4])
+                with _sa1:
+                    if st.button("Tout sélectionner", key="dedup_select_all", use_container_width=True):
+                        st.session_state["dedup_compare_cols"] = all_cols
+                with _sa2:
+                    if st.button("Tout désélectionner", key="dedup_clear_all", use_container_width=True):
+                        st.session_state["dedup_compare_cols"] = []
+                if "dedup_compare_cols" in st.session_state:
+                    st.session_state["dedup_compare_cols"] = [c for c in st.session_state["dedup_compare_cols"] if c in all_cols]
+                    compare_cols = st.multiselect("Colonnes pour la détection", all_cols, key="dedup_compare_cols")
+                else:
+                    compare_cols = st.multiselect("Colonnes pour la détection", all_cols, default=default_cols, key="dedup_compare_cols")
 
                 if st.button("Démarrer le nettoyage", type="primary", key="dedup_start", use_container_width=True):
                     with st.spinner("Création du backup..."):
@@ -7732,6 +7758,11 @@ def page_run_analysis():
                 st.rerun()
         with ca4:
             if st.button("Nouvelle analyse", use_container_width=True, key="res_restart"):
+                for k in ["fr_upload_anomalies", "fr_upload_stats", "fr_scan_done",
+                          "wizard_stats", "uploaded_df", "wiz_clean_df", "wizard_uploaded_df",
+                          "viewing_archived_id", "fr_clean_df", "fr_removed_df",
+                          "dedup_pipeline_state", "dedup_compare_cols", "dedup_compare_cols_saved"]:
+                    st.session_state.pop(k, None)
                 st.session_state["wizard_step"] = 1
                 st.rerun()
 
